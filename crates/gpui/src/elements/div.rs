@@ -2478,11 +2478,15 @@ impl Interactivity {
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
 
+            let unclamped_scroll_offset = *scroll_offset;
             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
             if scroll_to_bottom {
                 scroll_offset.y = -scroll_max.y;
             } else {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
+            }
+            if *scroll_offset != unclamped_scroll_offset {
+                window.stop_touch_momentum();
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {

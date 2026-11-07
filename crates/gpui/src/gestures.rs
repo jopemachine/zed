@@ -998,6 +998,10 @@ impl TouchGestureRecognizer {
         };
     }
 
+    pub(crate) fn stop_momentum(&mut self) {
+        self.momentum = None;
+    }
+
     pub(crate) fn has_momentum(&self) -> bool {
         self.momentum.is_some()
     }

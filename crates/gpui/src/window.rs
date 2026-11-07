@@ -5916,6 +5916,11 @@ impl Window {
         }));
     }
 
+    /// Ends post-fling momentum. A scroll container calls this when a fling runs past its edge.
+    pub(crate) fn stop_touch_momentum(&mut self) {
+        self.touch_gestures.stop_momentum();
+    }
+
     fn schedule_touch_momentum_tick(&mut self) {
         self.on_next_frame(|window, cx| {
             if let Some(gesture) = window.touch_gestures.tick_momentum() {

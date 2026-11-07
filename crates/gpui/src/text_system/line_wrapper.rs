@@ -117,7 +117,10 @@ impl LineWrapper {
                 };
 
                 width += item_width;
-                if width > wrap_width && ix > last_wrap_ix {
+                // A space past the edge hangs off the line, so it does not push the word before it down.
+                let is_hanging_space =
+                    matches!(candidate, WrapBoundaryCandidate::Char { character: ' ' });
+                if width > wrap_width && ix > last_wrap_ix && !is_hanging_space {
                     let wrap_at_candidate =
                         last_candidate_ix > 0 && width - last_candidate_width <= wrap_width;
 

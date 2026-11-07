@@ -522,6 +522,10 @@ impl LineWrapper {
         // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
         matches!(c, '\u{0980}'..='\u{09FF}') ||
 
+        // Hangul wraps at spaces like `word-break: keep-all`, not between syllables.
+        // https://en.wikipedia.org/wiki/Hangul_Syllables
+        matches!(c, '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{AC00}'..='\u{D7AF}') ||
+
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`

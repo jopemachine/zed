@@ -225,6 +225,8 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    /// V3DV's binner can read instance data before the queued copy that wrote it has finished.
+    finishes_queued_writes_before_rendering: bool,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1365,6 +1367,7 @@ impl WgpuRendererCore {
             is_bgr: false,
             dual_source_blending,
             adapter_info: context.adapter.get_info(),
+            finishes_queued_writes_before_rendering: context.adapter.get_info().name.contains("V3D"),
             target_format,
             max_texture_size,
         }
@@ -1496,6 +1499,15 @@ impl WgpuRendererCore {
                     scene.polychrome_sprites.len(),
                 )
             })?;
+        if self.finishes_queued_writes_before_rendering {
+            self.resources.queue.submit(std::iter::empty());
+            if let Err(error) = self.resources.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            }) {
+                log::warn!("Failed to wait for queued writes: {error:?}");
+            }
+        }
         self.prepare_texture_bind_groups(scene);
 
         let mut encoder =

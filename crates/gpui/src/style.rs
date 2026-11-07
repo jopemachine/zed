@@ -406,8 +406,9 @@ pub enum WhiteSpace {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum WordBreak {
     /// After a space that precedes a word, and before any character that is not a word character
-    /// ([`LineWrapper::is_word_char`](crate::LineWrapper::is_word_char)), so a CJK ideograph or
-    /// punctuation such as `/`, `(` or `?` allows a break before it.
+    /// ([`LineWrapper::is_word_char`](crate::LineWrapper::is_word_char)). Hangul letters are word
+    /// characters, so Korean breaks only at spaces, while a CJK ideograph or punctuation such as
+    /// `/`, `(` or `?` allows a break before it.
     #[default]
     WordCharacters,
     /// CSS `word-break: normal`: at the line break opportunities of the Unicode line breaking

@@ -1185,6 +1185,12 @@ mod tests {
             WrappedLinesCase {
                 text: "가나 다라마바사",
                 wrap_width: 50.,
+                line_breaking: LineBreaking::default(),
+                lines: &["가나 ", "다라마바사"],
+            },
+            WrappedLinesCase {
+                text: "가나 다라마바사",
+                wrap_width: 50.,
                 line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
                 lines: &["가나 ", "다라마바사"],
             },

@@ -885,6 +885,9 @@ impl StateInner {
         let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
             .max(px(0.))
             .min(scroll_max);
+        if new_scroll_top == self.scroll_top(scroll_top) {
+            window.stop_touch_momentum();
+        }
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.set_scroll_anchor(None);

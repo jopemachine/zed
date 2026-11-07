@@ -221,6 +221,8 @@ struct WgpuRendererCore {
     dual_source_blending: bool,
     transient_attachments: bool,
     adapter_info: wgpu::AdapterInfo,
+    /// V3DV's binner can read instance data before the queued copy that wrote it has finished.
+    finishes_queued_writes_before_rendering: bool,
     depth_texture: Option<DepthTexture>,
     /// Read by the headless renderer to create its render target.
     #[cfg(all(
@@ -1291,6 +1293,11 @@ impl WgpuRendererCore {
             dual_source_blending,
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
+            finishes_queued_writes_before_rendering: context
+                .adapter
+                .get_info()
+                .name
+                .contains("V3D"),
             depth_texture: None,
             #[cfg(all(
                 not(target_family = "wasm"),
@@ -1401,6 +1408,15 @@ impl WgpuRendererCore {
             0,
             bytemuck::bytes_of(&globals),
         );
+        if self.finishes_queued_writes_before_rendering {
+            self.resources.queue.submit(std::iter::empty());
+            if let Err(error) = self.resources.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            }) {
+                log::warn!("Failed to wait for queued writes: {error:?}");
+            }
+        }
         self.prepare_texture_bind_groups(scene);
         self.ensure_depth_texture(size);
         let depth_view = &self

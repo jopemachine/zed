@@ -886,11 +886,9 @@ mod tests {
                     IndentAdjustment::default()
                 )
                 .collect::<Vec<_>>(),
-            &[
-                Boundary::new(5, 0),
-                Boundary::new(9, 0),
-                Boundary::new(11, 0)
-            ],
+            // The space after the second element hangs off the row instead of pushing the
+            // element down.
+            &[Boundary::new(5, 0), Boundary::new(11, 0)],
         );
 
         // Test with element at the beginning and text afterward
@@ -926,10 +924,12 @@ mod tests {
                     IndentAdjustment::default()
                 )
                 .collect::<Vec<_>>(),
+            // The space after the element hangs off the element's row, so the next row starts at
+            // "more".
             &[
                 Boundary::new(6, 0),
                 Boundary::new(11, 0),
-                Boundary::new(12, 0),
+                Boundary::new(13, 0),
                 Boundary::new(18, 0)
             ],
         );
@@ -943,7 +943,9 @@ mod tests {
                     IndentAdjustment::default()
                 )
                 .collect::<Vec<_>>(),
-            &[Boundary::new(12, 0),], // special chars above take up 3, 2 and 3 bytes, so boundary ends up at 12
+            // The special chars above take up 3, 2 and 3 bytes, so the space is at 12. It hangs off
+            // the row and the next row starts at "e".
+            &[Boundary::new(13, 0)],
         );
     }
 
@@ -1270,10 +1272,11 @@ mod tests {
         assert_word("গিয়েছিলেন");
         assert_word("ছেলে");
         assert_word("হচ্ছিল");
+        // Hangul
+        assert_word("안녕하세요");
 
         // non-word characters
         assert_not_word("你好");
-        assert_not_word("안녕하세요");
         assert_not_word("こんにちは");
         assert_not_word("😀😁😂");
         assert_not_word("()[]{}<>");
@@ -1707,8 +1710,8 @@ mod tests {
         //
         // Expected wrapped lines (10 columns):
         //   |      ab  |  (row 0: 6 spaces + "ab ", len 9)
-        //   |        cd|  (row 1: 8 spaces + "cd", len 10)
-        //   |        ef|  (row 2: 8 spaces + "ef", len 10)
+        //   |        cd|  (row 1: 8 spaces + "cd", len 10, and a space hanging past the edge)
+        //   |        ef|  (row 2: 8 spaces + "ef", len 10, and a space hanging past the edge)
         //   |        gh|  (row 3: 8 spaces + "gh", len 10)
         assert_eq!(
             wrapper
@@ -1720,8 +1723,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             &[
                 Boundary::new(9, 8),
-                Boundary::new(11, 8),
-                Boundary::new(13, 8),
+                Boundary::new(12, 8),
                 Boundary::new(15, 8),
             ]
         );

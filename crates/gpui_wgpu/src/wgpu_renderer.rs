@@ -1367,7 +1367,11 @@ impl WgpuRendererCore {
             is_bgr: false,
             dual_source_blending,
             adapter_info: context.adapter.get_info(),
-            finishes_queued_writes_before_rendering: context.adapter.get_info().name.contains("V3D"),
+            finishes_queued_writes_before_rendering: context
+                .adapter
+                .get_info()
+                .name
+                .contains("V3D"),
             target_format,
             max_texture_size,
         }

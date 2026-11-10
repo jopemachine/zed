@@ -1,5 +1,6 @@
 use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
+use itertools::Either;
 use std::{borrow::Cow, iter, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -24,6 +25,28 @@ pub enum IndentAdjustment {
     SameIndent,
     /// Add N extra columns of indent (in space-character widths).
     ExtraColumns(u32),
+}
+
+/// A letter of UAX #14 class AL that takes three bytes in UTF-8, like every character
+/// matched by [`is_hangul`].
+const ALPHABETIC_PLACEHOLDER_FOR_HANGUL: char = '\u{1E00}';
+
+/// Whether the character is a Hangul syllable or jamo, all of which are encoded in three
+/// bytes in UTF-8.
+fn is_hangul(character: char) -> bool {
+    matches!(
+        character,
+        // Hangul Jamo
+        '\u{1100}'..='\u{11FF}'
+        // Hangul Compatibility Jamo
+        | '\u{3130}'..='\u{318F}'
+        // Hangul Jamo Extended-A
+        | '\u{A960}'..='\u{A97F}'
+        // Hangul Syllables and Hangul Jamo Extended-B
+        | '\u{AC00}'..='\u{D7FF}'
+        // Halfwidth Hangul variants
+        | '\u{FFA0}'..='\u{FFDC}'
+    )
 }
 
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
@@ -543,8 +566,31 @@ impl LineWrapper {
 
     /// The byte offsets in `text` at which a line break is allowed.
     pub(crate) fn break_indices(text: &str) -> impl Iterator<Item = usize> {
-        icu_segmenter::LineSegmenter::new_for_non_complex_scripts(Default::default())
-            .segment_str(text)
+        let segmenter =
+            icu_segmenter::LineSegmenter::new_for_non_complex_scripts(Default::default());
+        if !text.contains(is_hangul) {
+            return Either::Left(segmenter.segment_str(text));
+        }
+        // Korean separates words with spaces, so we apply the tailoring that UAX #14 describes
+        // for it and treat Hangul as alphabetic instead of allowing a break between syllables.
+        // The segmenter has no option for this that leaves other ideographs alone, so it sees
+        // a copy of the text in which Hangul is replaced by a letter with the same UTF-8 length.
+        let text_with_hangul_as_letters: String = text
+            .chars()
+            .map(|character| {
+                if is_hangul(character) {
+                    ALPHABETIC_PLACEHOLDER_FOR_HANGUL
+                } else {
+                    character
+                }
+            })
+            .collect();
+        Either::Right(
+            segmenter
+                .segment_str(&text_with_hangul_as_letters)
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
     }
 
     #[inline(always)]
@@ -1119,6 +1165,46 @@ mod tests {
             ("aaa αβγδε", "aaa αβγδ", 4),
             ("aaa a\u{a0}b", "aaa a\u{a0}", 4),
             ("aaa 你好！", "aaa 你好", 7),
+        ] {
+            let wrap_width = fitting_prefix
+                .chars()
+                .map(|character| wrapper.width_for_char(character))
+                .sum();
+            assert_eq!(
+                wrapper
+                    .wrap_line(
+                        &[LineFragment::text(text)],
+                        wrap_width,
+                        IndentAdjustment::default()
+                    )
+                    .collect::<Vec<_>>(),
+                [Boundary::new(expected_index, 0)],
+                "{text:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_wrap_line_keeps_hangul_words_together() {
+        let mut wrapper = build_wrapper();
+        for (text, fitting_prefix, expected_index) in [
+            // Wraps at the space instead of between syllables.
+            ("가나 다라마", "가나 다라", 7),
+            // Conjoining jamo.
+            (
+                "가나 \u{1103}\u{1161}\u{1105}\u{1161}",
+                "가나 \u{1103}\u{1161}",
+                7,
+            ),
+            // Particles stay attached to the word they follow.
+            ("aaa Zed는", "aaa Zed", 4),
+            ("aaa 2026년", "aaa 2026", 4),
+            ("aaaaa 서울(Seoul)은", "aaaaa 서울(Seoul)", 6),
+            // A word wider than the line still wraps between syllables.
+            ("가나다라마", "가나다", 9),
+            // Other East Asian scripts keep their break opportunities.
+            ("aaa かなカ", "aaa かな", 10),
+            ("가나 漢字漢", "가나 漢字", 13),
         ] {
             let wrap_width = fitting_prefix
                 .chars()

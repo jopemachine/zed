@@ -811,16 +811,19 @@ mod tests {
             _: &mut Window,
             _: &mut App,
         ) -> Option<Bounds<Pixels>> {
-            None
+            Some(Bounds::new(
+                crate::point(crate::px(40.), crate::px(80.)),
+                crate::size(crate::px(10.), crate::px(20.)),
+            ))
         }
 
         fn character_index_for_point(
             &mut self,
-            _: Point<Pixels>,
+            point: Point<Pixels>,
             _: &mut Window,
             _: &mut App,
         ) -> Option<usize> {
-            None
+            Some(f32::from(point.x) as usize)
         }
     }
 
@@ -2140,6 +2143,35 @@ mod tests {
         cx.update(|window, _| assert!(window.pending_input_is_none()));
         assert_eq!(action_count.get(), 0);
         assert_eq!(secondary_action_count.get(), 0);
+    }
+
+    #[crate::test]
+    fn test_input_handler_answers_the_platform_in_its_pixels(cx: &mut TestAppContext) {
+        let (test, cx) = cx.add_window_view(|_, cx| PendingTextInputTestView::new(cx));
+        let focus_handle = test.update(cx, |test, _| test.focus_handle.clone());
+        cx.update(|window, cx| {
+            window.focus(&focus_handle, cx);
+            window.activate_window();
+            window.set_content_scale(1.25, cx);
+        });
+        cx.run_until_parked();
+
+        let mut platform_window = cx.test_window(cx.window_handle());
+        let mut input_handler = platform_window
+            .take_input_handler()
+            .expect("the focused view handles input");
+        assert_eq!(
+            input_handler.bounds_for_range(0..0),
+            Some(Bounds::new(
+                crate::point(crate::px(50.), crate::px(100.)),
+                crate::size(crate::px(12.5), crate::px(25.)),
+            ))
+        );
+        assert_eq!(
+            input_handler.character_index_for_point(crate::point(crate::px(500.), crate::px(0.))),
+            Some(400)
+        );
+        platform_window.set_input_handler(input_handler);
     }
 
     #[crate::test]

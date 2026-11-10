@@ -93,15 +93,11 @@ impl LineLayout {
             }
         }
 
-        if self.len == 1 {
-            if x > self.width / 2. {
-                return 1;
-            } else {
-                return 0;
-            }
+        if x >= self.width || self.width - x < x - prev_x {
+            self.len
+        } else {
+            prev_index
         }
-
-        self.len
     }
 
     /// The x position of the character at the given index
@@ -1103,6 +1099,24 @@ mod tests {
             .iter()
             .map(|g| f32::from(g.position.x))
             .collect()
+    }
+
+    #[test]
+    fn test_closest_index_for_x_within_last_glyph() {
+        let mut layout = make_layout(vec![glyph_at(0., 0), glyph_at(40., 3), glyph_at(80., 6)]);
+        layout.len = 9;
+
+        assert_eq!(layout.closest_index_for_x(px(50.)), 3);
+        assert_eq!(layout.closest_index_for_x(px(70.)), 6);
+        assert_eq!(layout.closest_index_for_x(px(85.)), 6);
+        assert_eq!(layout.closest_index_for_x(px(95.)), 9);
+        assert_eq!(layout.closest_index_for_x(px(100.)), 9);
+        assert_eq!(layout.closest_index_for_x(px(120.)), 9);
+
+        let mut single_glyph = make_layout(vec![glyph_at(0., 0)]);
+        single_glyph.len = 3;
+        assert_eq!(single_glyph.closest_index_for_x(px(40.)), 0);
+        assert_eq!(single_glyph.closest_index_for_x(px(60.)), 3);
     }
 
     #[test]

@@ -800,6 +800,76 @@ pub enum PlatformInput {
 }
 
 impl PlatformInput {
+    /// This event with every position and pixel scroll distance divided by `divisor`.
+    pub(crate) fn with_positions_divided_by(self, divisor: f32) -> Self {
+        match self {
+            PlatformInput::KeyDown(_)
+            | PlatformInput::KeyUp(_)
+            | PlatformInput::ModifiersChanged(_) => self,
+            PlatformInput::MouseDown(mut event) => {
+                event.position = event.position / divisor;
+                PlatformInput::MouseDown(event)
+            }
+            PlatformInput::MouseUp(mut event) => {
+                event.position = event.position / divisor;
+                PlatformInput::MouseUp(event)
+            }
+            PlatformInput::MousePressure(mut event) => {
+                event.position = event.position / divisor;
+                PlatformInput::MousePressure(event)
+            }
+            PlatformInput::MouseMove(mut event) => {
+                event.position = event.position / divisor;
+                PlatformInput::MouseMove(event)
+            }
+            PlatformInput::MouseExited(mut event) => {
+                event.position = event.position / divisor;
+                PlatformInput::MouseExited(event)
+            }
+            PlatformInput::ScrollWheel(mut event) => {
+                event.position = event.position / divisor;
+                if let ScrollDelta::Pixels(delta) = event.delta {
+                    event.delta = ScrollDelta::Pixels(delta / divisor);
+                }
+                PlatformInput::ScrollWheel(event)
+            }
+            PlatformInput::Pinch(mut event) => {
+                event.position = event.position / divisor;
+                PlatformInput::Pinch(event)
+            }
+            PlatformInput::LongPress(mut event) => {
+                event.start_position = event.start_position / divisor;
+                event.position = event.position / divisor;
+                PlatformInput::LongPress(event)
+            }
+            PlatformInput::TouchDrag(mut event) => {
+                event.start_position = event.start_position / divisor;
+                event.position = event.position / divisor;
+                PlatformInput::TouchDrag(event)
+            }
+            PlatformInput::FileDrop(event) => PlatformInput::FileDrop(match event {
+                FileDropEvent::Entered { position, paths } => FileDropEvent::Entered {
+                    position: position / divisor,
+                    paths,
+                },
+                FileDropEvent::Pending { position } => FileDropEvent::Pending {
+                    position: position / divisor,
+                },
+                FileDropEvent::Submit { position } => FileDropEvent::Submit {
+                    position: position / divisor,
+                },
+                FileDropEvent::Exited => FileDropEvent::Exited,
+                FileDropEvent::Ended => FileDropEvent::Ended,
+            }),
+            PlatformInput::Touch(mut event) => {
+                event.position = event.position / divisor;
+                event.predicted_position =
+                    event.predicted_position.map(|position| position / divisor);
+                PlatformInput::Touch(event)
+            }
+        }
+    }
+
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
         match self {
             PlatformInput::KeyDown { .. } => None,

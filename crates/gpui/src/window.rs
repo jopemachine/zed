@@ -1263,6 +1263,7 @@ pub struct Window {
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
+    content_scale: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
@@ -2042,7 +2043,9 @@ impl Window {
             let mut cx = cx.to_async();
             Box::new(move |event| {
                 handle
-                    .update(&mut cx, |_, window, cx| window.dispatch_event(event, cx))
+                    .update(&mut cx, |_, window, cx| {
+                        window.dispatch_platform_input(event, cx)
+                    })
                     .log_err()
                     .unwrap_or(DispatchEventResult::default())
             })
@@ -2163,6 +2166,7 @@ impl Window {
             modifiers,
             capslock,
             scale_factor,
+            content_scale: 1.,
             bounds_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
@@ -2490,6 +2494,12 @@ impl Window {
     /// surface be moved out of others' exclusive zones, and -1 ignores reserved
     /// space and may extend under other surfaces. (Wayland layer-shell windows only)
     pub fn set_exclusive_zone(&self, zone: Pixels) {
+        // Negative values are flags, not distances.
+        let zone = if zone > Pixels::ZERO {
+            zone * self.content_scale
+        } else {
+            zone
+        };
         self.platform_window.set_exclusive_zone(zone);
     }
 
@@ -2516,7 +2526,18 @@ impl Window {
     /// - `Some(&[])` is an empty region, so the window receives no pointer or touch input.
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
-        self.platform_window.set_input_region(region);
+        if self.content_scale == 1. {
+            self.platform_window.set_input_region(region);
+        } else {
+            let platform_region = region.map(|rects| {
+                rects
+                    .iter()
+                    .map(|rect| rect.map(|length| length * self.content_scale))
+                    .collect::<Vec<_>>()
+            });
+            self.platform_window
+                .set_input_region(platform_region.as_deref());
+        }
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
@@ -2789,9 +2810,12 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
-        self.mouse_position = self.platform_window.mouse_position();
+        self.scale_factor = self.platform_window.scale_factor() * self.content_scale;
+        self.viewport_size = self
+            .platform_window
+            .content_size()
+            .map(|length| length / self.content_scale);
+        self.mouse_position = self.platform_window.mouse_position() / self.content_scale;
 
         self.refresh();
 
@@ -2935,7 +2959,9 @@ impl Window {
     /// During drawing this is a consistent frame snapshot. Outside drawing it
     /// reflects the latest platform sample, not a synchronous geometry query.
     pub fn visual_viewport_bounds(&self) -> Bounds<Pixels> {
-        self.platform_window.visual_viewport_bounds()
+        self.platform_window
+            .visual_viewport_bounds()
+            .map(|length| length / self.content_scale)
     }
 
     /// Returns a conservative rectangle avoiding platform-known obscured content.
@@ -2944,11 +2970,16 @@ impl Window {
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
         let insets = self.platform_window.insets().effective();
+        let content_scale = self.content_scale;
         let viewport = self.viewport_size();
-        let left = insets.left.max(Pixels::ZERO).min(viewport.width);
-        let top = insets.top.max(Pixels::ZERO).min(viewport.height);
-        let right = (viewport.width - insets.right.max(Pixels::ZERO)).max(left);
-        let bottom = (viewport.height - insets.bottom.max(Pixels::ZERO)).max(top);
+        let left = (insets.left / content_scale)
+            .max(Pixels::ZERO)
+            .min(viewport.width);
+        let top = (insets.top / content_scale)
+            .max(Pixels::ZERO)
+            .min(viewport.height);
+        let right = (viewport.width - (insets.right / content_scale).max(Pixels::ZERO)).max(left);
+        let bottom = (viewport.height - (insets.bottom / content_scale).max(Pixels::ZERO)).max(top);
         let safe_bounds = Bounds::from_corners(point(left, top), point(right, bottom));
         let mut visible = safe_bounds.intersect(&self.visual_viewport_bounds());
         visible.size.width = visible.size.width.max(Pixels::ZERO);
@@ -2996,7 +3027,8 @@ impl Window {
 
     /// Opens the native title bar context menu, useful when implementing client side decorations (Wayland and X11)
     pub fn show_window_menu(&self, position: Point<Pixels>) {
-        self.platform_window.show_window_menu(position)
+        self.platform_window
+            .show_window_menu(position * self.content_scale)
     }
 
     /// Handle window movement for Linux and macOS.
@@ -3010,7 +3042,8 @@ impl Window {
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
-        self.platform_window.set_client_inset(inset);
+        self.platform_window
+            .set_client_inset(inset * self.content_scale);
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -3047,7 +3080,8 @@ impl Window {
     /// Sets the position of the macOS traffic light buttons.
     #[cfg(target_os = "macos")]
     pub fn set_traffic_light_position(&self, position: Point<Pixels>) {
-        self.platform_window.set_traffic_light_position(position);
+        self.platform_window
+            .set_traffic_light_position(position * self.content_scale);
     }
 
     /// Sets the application identifier.
@@ -3097,6 +3131,46 @@ impl Window {
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
         self.scale_factor = scale_factor;
         self.refresh();
+    }
+
+    /// How much larger than the platform's logical pixels this window draws its content.
+    /// Defaults to 1.
+    pub fn content_scale(&self) -> f32 {
+        self.content_scale
+    }
+
+    /// Draws the window's content `content_scale` times larger, like a browser's page zoom.
+    ///
+    /// The window keeps its size on screen, so [`Self::viewport_size`] shrinks by the same
+    /// factor and [`Self::scale_factor`] grows by it. Layout, painting, pointer positions,
+    /// scroll distances and the positions an input method asks for all use the scaled pixels.
+    /// Sizes and positions of the window itself ([`Self::bounds`], [`Self::resize`]) stay in
+    /// the platform's pixels.
+    pub fn set_content_scale(&mut self, content_scale: f32, cx: &mut App) {
+        if !(content_scale.is_finite() && content_scale > 0.) || content_scale == self.content_scale
+        {
+            return;
+        }
+        if let Some(inset) = self.client_inset {
+            self.platform_window.set_client_inset(inset * content_scale);
+        }
+        self.content_scale = content_scale;
+        self.bounds_changed(cx);
+    }
+
+    /// Dispatches an event from the platform window, whose positions and scroll distances are
+    /// in the platform's pixels.
+    pub fn dispatch_platform_input(
+        &mut self,
+        event: PlatformInput,
+        cx: &mut App,
+    ) -> DispatchEventResult {
+        let event = if self.content_scale == 1. {
+            event
+        } else {
+            event.with_positions_divided_by(self.content_scale)
+        };
+        self.dispatch_event(event, cx)
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the
@@ -6659,7 +6733,9 @@ impl Window {
         self.on_next_frame(|window, cx| {
             if let Some(mut input_handler) = window.platform_window.take_input_handler() {
                 if let Some(bounds) = input_handler.selected_bounds(window, cx) {
-                    window.platform_window.update_ime_position(bounds);
+                    window
+                        .platform_window
+                        .update_ime_position(bounds.map(|length| length * window.content_scale));
                 }
                 window.platform_window.set_input_handler(input_handler);
             }
@@ -8337,6 +8413,107 @@ mod tests {
         // subsequent draws of both windows work against a fresh arena.
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
             .unwrap();
+    }
+
+    #[test]
+    fn test_content_scale_shrinks_viewport_and_platform_input() {
+        struct RecordingView {
+            mouse_down_positions: Rc<RefCell<Vec<Point<Pixels>>>>,
+            scroll_distances: Rc<RefCell<Vec<Point<Pixels>>>>,
+        }
+
+        impl Render for RecordingView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mouse_down_positions = self.mouse_down_positions.clone();
+                let scroll_distances = self.scroll_distances.clone();
+                div()
+                    .size_full()
+                    .on_mouse_down(MouseButton::Left, move |event, _, _| {
+                        mouse_down_positions.borrow_mut().push(event.position);
+                    })
+                    .on_scroll_wheel(move |event, _, _| {
+                        scroll_distances
+                            .borrow_mut()
+                            .push(event.delta.pixel_delta(px(20.)));
+                    })
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        let mouse_down_positions = Rc::new(RefCell::new(Vec::new()));
+        let scroll_distances = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let mouse_down_positions = mouse_down_positions.clone();
+            let scroll_distances = scroll_distances.clone();
+            move |_, _| RecordingView {
+                mouse_down_positions,
+                scroll_distances,
+            }
+        });
+        let handle: AnyWindowHandle = window.into();
+        cx.simulate_window_resize(handle, size(px(800.), px(600.)));
+        cx.run_until_parked();
+        let (platform_scale_factor, window_bounds) = cx
+            .update_window(handle, |_, window, _| {
+                (window.scale_factor(), window.bounds())
+            })
+            .unwrap();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.set_content_scale(1.25, cx);
+            assert_eq!(window.content_scale(), 1.25);
+            assert_eq!(window.scale_factor(), platform_scale_factor * 1.25);
+            assert_eq!(window.viewport_size(), size(px(640.), px(480.)));
+            assert_eq!(window.bounds(), window_bounds);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        cx.update_window(handle, |_, window, cx| {
+            window.dispatch_platform_input(
+                PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(500.), px(250.)),
+                    modifiers: crate::Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                cx,
+            );
+            assert_eq!(window.mouse_position(), point(px(400.), px(200.)));
+            window.dispatch_platform_input(
+                PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                    position: point(px(500.), px(250.)),
+                    delta: crate::ScrollDelta::Pixels(point(px(0.), px(-50.))),
+                    ..Default::default()
+                }),
+                cx,
+            );
+            window.dispatch_platform_input(
+                PlatformInput::ScrollWheel(crate::ScrollWheelEvent {
+                    position: point(px(500.), px(250.)),
+                    delta: crate::ScrollDelta::Lines(point(0., -2.)),
+                    ..Default::default()
+                }),
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            *mouse_down_positions.borrow(),
+            vec![point(px(400.), px(200.))]
+        );
+        assert_eq!(
+            *scroll_distances.borrow(),
+            vec![point(px(0.), px(-40.)), point(px(0.), px(-40.))]
+        );
+
+        cx.update_window(handle, |_, window, cx| {
+            window.set_content_scale(1., cx);
+            assert_eq!(window.scale_factor(), platform_scale_factor);
+            assert_eq!(window.viewport_size(), size(px(800.), px(600.)));
+        })
+        .unwrap();
     }
 
     #[test]

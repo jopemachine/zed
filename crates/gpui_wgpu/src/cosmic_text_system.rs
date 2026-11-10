@@ -17,11 +17,15 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, ops::Range, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
-    zeno::{Format, Vector},
+    zeno::{Format, Transform, Vector},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
 pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
+
+/// The horizontal shear of glyphs drawn italic from a face that is not italic, as a fraction of
+/// the height above the baseline.
+const SYNTHETIC_SLANT: f32 = 0.25;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -57,6 +61,9 @@ struct CosmicTextSystemState {
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    /// Ids that draw an upright face slanted, by the id of the upright face. Italic requests for
+    /// a family without an italic face resolve to these.
+    slanted_font_ids_by_upright_font_id: HashMap<FontId, FontId>,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
 }
@@ -65,6 +72,7 @@ struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
     is_known_emoji_font: bool,
+    is_synthetically_slanted: bool,
     /// resolved at load time so `layout_line` shares one chain across faces.
     /// `Arc` keeps clone cheap on the per-run hot path.
     user_fallback_chain: Arc<[(FontId, SharedString)]>,
@@ -108,6 +116,7 @@ impl CosmicTextSystem {
             .face(font.font.id())
             .context("font face not found")?;
         let style = match face.style {
+            cosmic_text::Style::Normal if font.is_synthetically_slanted => gpui::FontStyle::Oblique,
             cosmic_text::Style::Normal => gpui::FontStyle::Normal,
             cosmic_text::Style::Italic => gpui::FontStyle::Italic,
             cosmic_text::Style::Oblique => gpui::FontStyle::Oblique,
@@ -139,6 +148,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
+            slanted_font_ids_by_upright_font_id: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
         }))
@@ -158,6 +168,7 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
+            slanted_font_ids_by_upright_font_id: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
         }))
@@ -204,8 +215,13 @@ impl PlatformTextSystem for CosmicTextSystem {
         };
 
         let ix = find_best_match(font, candidates, &state)?;
+        let font_id = candidates[ix];
 
-        Ok(candidates[ix])
+        if font.style != gpui::FontStyle::Normal && state.is_upright_face(font_id) {
+            Ok(state.slanted_font_id(font_id))
+        } else {
+            Ok(font_id)
+        }
     }
 
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
@@ -286,6 +302,40 @@ impl PlatformTextSystem for CosmicTextSystem {
 impl CosmicTextSystemState {
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
+    }
+
+    fn is_upright_face(&self, font_id: FontId) -> bool {
+        self.font_system
+            .db()
+            .face(self.loaded_font(font_id).font.id())
+            .is_some_and(|face| face.style == Style::Normal)
+    }
+
+    /// The id that draws the upright face of `upright_font_id` slanted. Emoji faces are not
+    /// slanted.
+    fn slanted_font_id(&mut self, upright_font_id: FontId) -> FontId {
+        let upright_font = self.loaded_font(upright_font_id);
+        if upright_font.is_known_emoji_font || upright_font.is_synthetically_slanted {
+            return upright_font_id;
+        }
+        if let Some(slanted_font_id) = self
+            .slanted_font_ids_by_upright_font_id
+            .get(&upright_font_id)
+        {
+            return *slanted_font_id;
+        }
+        let slanted_font = LoadedFont {
+            font: Arc::clone(&upright_font.font),
+            features: upright_font.features.clone(),
+            is_known_emoji_font: false,
+            is_synthetically_slanted: true,
+            user_fallback_chain: Arc::clone(&upright_font.user_fallback_chain),
+        };
+        let slanted_font_id = FontId(self.loaded_fonts.len());
+        self.loaded_fonts.push(slanted_font);
+        self.slanted_font_ids_by_upright_font_id
+            .insert(upright_font_id, slanted_font_id);
+        slanted_font_id
     }
 
     fn font_match_properties(&self, font_id: FontId) -> Option<FontMatchProperties> {
@@ -438,6 +488,7 @@ impl CosmicTextSystemState {
                 font,
                 features: cosmic_features.clone(),
                 is_known_emoji_font: check_is_known_emoji_font(&postscript_name),
+                is_synthetically_slanted: false,
                 user_fallback_chain: Arc::clone(&user_fallback_chain),
             });
             self.loaded_font_ids_by_key.insert(key, font_id);
@@ -550,6 +601,10 @@ impl CosmicTextSystemState {
             renderer.format(Format::Alpha).offset(subpixel_offset);
         }
 
+        if loaded_font.is_synthetically_slanted {
+            renderer.transform(Some(Transform::new(1., 0., SYNTHETIC_SLANT, 1., 0., 0.)));
+        }
+
         let glyph_id: u16 = params.glyph_id.0.try_into()?;
         renderer
             .render(&mut scaler, glyph_id)
@@ -565,11 +620,9 @@ impl CosmicTextSystemState {
     /// current use of this field is for the *input* of `layout_line`, and so it's fine to use
     /// `font_id_for_cosmic_id` when computing the *output* of `layout_line`.
     fn font_id_for_cosmic_id(&mut self, id: cosmic_text::fontdb::ID) -> Result<FontId> {
-        if let Some(ix) = self
-            .loaded_fonts
-            .iter()
-            .position(|loaded_font| loaded_font.font.id() == id)
-        {
+        if let Some(ix) = self.loaded_fonts.iter().position(|loaded_font| {
+            loaded_font.font.id() == id && !loaded_font.is_synthetically_slanted
+        }) {
             Ok(FontId(ix))
         } else {
             let font = self
@@ -587,6 +640,7 @@ impl CosmicTextSystemState {
                 font,
                 features: CosmicFontFeatures::new(),
                 is_known_emoji_font: check_is_known_emoji_font(&face.post_script_name),
+                is_synthetically_slanted: false,
                 user_fallback_chain: Arc::from(Vec::new()),
             });
 
@@ -697,9 +751,13 @@ impl CosmicTextSystemState {
         font_runs: &[FontRun],
     ) -> LineLayout {
         let mut attrs_list = AttrsList::new(&Attrs::new());
+        let mut slanted_text_ranges = SmallVec::<[Range<usize>; 2]>::new();
         let mut offs = 0;
         for run in font_runs {
             let run_end = offs + run.len;
+            if self.loaded_font(run.font_id).is_synthetically_slanted {
+                slanted_text_ranges.push(offs..run_end);
+            }
 
             let Some(properties) = self.font_match_properties(run.font_id) else {
                 offs = run_end;
@@ -808,6 +866,15 @@ impl CosmicTextSystemState {
                 }
             }
             let is_emoji = loaded_font.is_known_emoji_font;
+            // A slanted run's fallback faces are upright ones of other families.
+            if !loaded_font.is_synthetically_slanted
+                && slanted_text_ranges
+                    .iter()
+                    .any(|slanted| slanted.contains(&glyph.start))
+                && self.is_upright_face(font_id)
+            {
+                font_id = self.slanted_font_id(font_id);
+            }
 
             // HACK: Prevent crash caused by variation selectors.
             if glyph.glyph_id == 3 && is_emoji {
@@ -1270,8 +1337,19 @@ mod tests {
         let text_system = text_system()?;
         let regular = gpui::font("IBM Plex Sans");
         let regular_id = text_system.font_id(&regular)?;
+        let medium_id = text_system.font_id(&Font {
+            weight: gpui::FontWeight::MEDIUM,
+            ..regular.clone()
+        })?;
+        assert_eq!(medium_id, regular_id);
+        assert_eq!(
+            text_system.font_weight_and_style(medium_id)?,
+            (gpui::FontWeight::NORMAL, gpui::FontStyle::Normal)
+        );
+
+        let slanted_id = text_system.font_id(&regular.clone().italic())?;
+        assert_ne!(slanted_id, regular_id);
         for (weight, style) in [
-            (gpui::FontWeight::MEDIUM, gpui::FontStyle::Normal),
             (gpui::FontWeight::BOLD, gpui::FontStyle::Italic),
             (gpui::FontWeight::NORMAL, gpui::FontStyle::Oblique),
         ] {
@@ -1281,12 +1359,73 @@ mod tests {
                 ..regular.clone()
             };
             let font_id = text_system.font_id(&requested)?;
-            assert_eq!(font_id, regular_id);
+            assert_eq!(font_id, slanted_id);
             assert_eq!(
                 text_system.font_weight_and_style(font_id)?,
-                (gpui::FontWeight::NORMAL, gpui::FontStyle::Normal)
+                (gpui::FontWeight::NORMAL, gpui::FontStyle::Oblique)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn italic_of_family_without_italic_face_is_slanted() -> Result<()> {
+        let text_system = text_system()?;
+        let upright_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let slanted_id = text_system.font_id(&gpui::font("IBM Plex Sans").italic())?;
+
+        let layout_with =
+            |font_id| text_system.layout_line("l", gpui::px(32.0), &[FontRun { len: 1, font_id }]);
+        let upright_layout = layout_with(upright_id);
+        let slanted_layout = layout_with(slanted_id);
+        assert_eq!(upright_layout.width, slanted_layout.width);
+        assert_eq!(upright_layout.runs[0].font_id, upright_id);
+        assert_eq!(slanted_layout.runs[0].font_id, slanted_id);
+
+        let glyph_params = |font_id| RenderGlyphParams {
+            font_id,
+            glyph_id: upright_layout.runs[0].glyphs[0].id,
+            font_size: gpui::px(32.0),
+            subpixel_variant: point(0, 0),
+            scale_factor: 2.0,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let upright_bounds = text_system.glyph_raster_bounds(&glyph_params(upright_id))?;
+        let slanted_bounds = text_system.glyph_raster_bounds(&glyph_params(slanted_id))?;
+        assert!(slanted_bounds.size.width > upright_bounds.size.width);
+
+        let (bitmap_size, alpha) =
+            text_system.rasterize_glyph(&glyph_params(slanted_id), slanted_bounds)?;
+        let width = bitmap_size.width.0 as usize;
+        let height = bitmap_size.height.0 as usize;
+        let ink_center_of_row = |row: usize| {
+            let inked_columns = (0..width)
+                .filter(|column| alpha[row * width + column] > 127)
+                .collect::<Vec<_>>();
+            inked_columns.iter().sum::<usize>() as f32 / inked_columns.len() as f32
+        };
+        assert!(ink_center_of_row(height / 4) > ink_center_of_row(height * 3 / 4) + 2.0);
+        Ok(())
+    }
+
+    #[test]
+    fn italic_face_of_family_is_not_slanted() -> Result<()> {
+        let text_system = CosmicTextSystem::new_without_system_fonts("Lilex");
+        text_system.add_fonts(vec![
+            Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+            )),
+            Cow::Borrowed(include_bytes!(
+                "../../../assets/fonts/lilex/Lilex-Italic.ttf"
+            )),
+        ])?;
+        let italic_id = text_system.font_id(&gpui::font("Lilex").italic())?;
+        assert_eq!(
+            text_system.font_weight_and_style(italic_id)?.1,
+            gpui::FontStyle::Italic
+        );
         Ok(())
     }
 

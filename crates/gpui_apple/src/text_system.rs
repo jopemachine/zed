@@ -11,14 +11,14 @@ use core_graphics::{
     base::{CGFloat, CGGlyph, kCGImageAlphaPremultipliedLast},
     color_space::CGColorSpace,
     context::{CGContext, CGTextDrawingMode},
-    geometry::CGPoint,
+    geometry::{CGAffineTransform, CGPoint},
 };
 use core_text::{
     font::CTFont,
     font_collection::CTFontCollectionRef,
     font_descriptor::{
-        CTFontDescriptor, kCTFontSlantTrait, kCTFontSymbolicTrait, kCTFontWeightTrait,
-        kCTFontWidthTrait,
+        CTFontDescriptor, SymbolicTraitAccessors, kCTFontSlantTrait, kCTFontSymbolicTrait,
+        kCTFontWeightTrait, kCTFontWidthTrait,
     },
     line::CTLine,
     string_attributes::kCTFontAttributeName,
@@ -59,6 +59,10 @@ use crate::open_type::apply_features_and_fallbacks;
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
+/// The horizontal shear of glyphs drawn italic from a face that is not italic, as a fraction of
+/// the height above the baseline.
+const SYNTHETIC_SLANT: f32 = 0.25;
+
 /// Apple text system using CoreText for font shaping.
 pub struct AppleTextSystem(RwLock<AppleTextSystemState>);
 
@@ -77,6 +81,10 @@ struct AppleTextSystemState {
     font_ids_by_postscript_name: HashMap<String, FontId>,
     font_ids_by_font_key: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     postscript_names_by_font_id: HashMap<FontId, String>,
+    /// Ids that draw an upright face slanted, by the id of the upright face. Italic requests for
+    /// a family without an italic face resolve to these.
+    slanted_font_ids_by_upright_font_id: HashMap<FontId, FontId>,
+    slanted_font_ids: HashSet<FontId>,
 }
 
 impl AppleTextSystem {
@@ -90,6 +98,8 @@ impl AppleTextSystem {
             font_ids_by_postscript_name: HashMap::default(),
             font_ids_by_font_key: HashMap::default(),
             postscript_names_by_font_id: HashMap::default(),
+            slanted_font_ids_by_upright_font_id: HashMap::default(),
+            slanted_font_ids: HashSet::default(),
         }))
     }
 }
@@ -174,6 +184,13 @@ impl PlatformTextSystem for AppleTextSystem {
             )?;
 
             let font_id = candidates[ix];
+            let font_id = if font.style != FontStyle::Normal
+                && candidate_properties[ix].style == FontkitStyle::Normal
+            {
+                lock.slanted_font_id(font_id)
+            } else {
+                font_id
+            };
             lock.font_selections.insert(font.clone(), font_id);
             Ok(font_id)
         }
@@ -418,6 +435,30 @@ impl AppleTextSystemState {
         }
     }
 
+    /// The id that draws the upright face of `upright_font_id` slanted. Emoji faces are not
+    /// slanted.
+    fn slanted_font_id(&mut self, upright_font_id: FontId) -> FontId {
+        if self.is_emoji(upright_font_id) {
+            return upright_font_id;
+        }
+        if let Some(slanted_font_id) = self
+            .slanted_font_ids_by_upright_font_id
+            .get(&upright_font_id)
+        {
+            return *slanted_font_id;
+        }
+        let slanted_font_id = FontId(self.fonts.len());
+        self.fonts.push(self.fonts[upright_font_id.0].clone());
+        if let Some(postscript_name) = self.postscript_names_by_font_id.get(&upright_font_id) {
+            self.postscript_names_by_font_id
+                .insert(slanted_font_id, postscript_name.clone());
+        }
+        self.slanted_font_ids_by_upright_font_id
+            .insert(upright_font_id, slanted_font_id);
+        self.slanted_font_ids.insert(slanted_font_id);
+        slanted_font_id
+    }
+
     fn is_emoji(&self, font_id: FontId) -> bool {
         self.postscript_names_by_font_id
             .get(&font_id)
@@ -436,6 +477,22 @@ impl AppleTextSystemState {
             HintingOptions::None,
             font_kit::canvas::RasterizationOptions::GrayscaleAa,
         )?);
+
+        let bounds = if self.slanted_font_ids.contains(&params.font_id) {
+            // The shear moves a point by its height above the baseline, and `y` grows downward
+            // here.
+            let left = bounds.origin.x.0 as f32 - SYNTHETIC_SLANT * bounds.bottom().0.max(0) as f32;
+            let right = bounds.right().0 as f32 - SYNTHETIC_SLANT * bounds.origin.y.0.min(0) as f32;
+            Bounds {
+                origin: point(DevicePixels(left.floor() as i32), bounds.origin.y),
+                size: size(
+                    DevicePixels(right.ceil() as i32 - left.floor() as i32),
+                    bounds.size.height,
+                ),
+            }
+        } else {
+            bounds
+        };
 
         // Expand the bounds by 1 pixel on each side to give CG room for anti-aliasing.
         Ok(bounds.dilate(DevicePixels(1)))
@@ -496,6 +553,17 @@ impl AppleTextSystemState {
                 params.scale_factor as CGFloat,
             );
 
+            if self.slanted_font_ids.contains(&params.font_id) {
+                cx.concat_ctm(CGAffineTransform::new(
+                    1.0,
+                    0.0,
+                    SYNTHETIC_SLANT as CGFloat,
+                    1.0,
+                    0.0,
+                    0.0,
+                ));
+            }
+
             let subpixel_shift = params
                 .subpixel_variant
                 .map(|v| v as f32 / SUBPIXEL_VARIANTS_X as f32);
@@ -542,6 +610,7 @@ impl AppleTextSystemState {
         let mut string = CFMutableAttributedString::new();
         let mut max_ascent = 0.0f32;
         let mut max_descent = 0.0f32;
+        let mut slanted_utf16_ranges = SmallVec::<[std::ops::Range<usize>; 2]>::new();
 
         {
             let mut text = text;
@@ -557,6 +626,9 @@ impl AppleTextSystemState {
 
                 let length = utf16_end - utf16_start;
                 let cf_range = CFRange::init(utf16_start, length);
+                if self.slanted_font_ids.contains(&run.font_id) {
+                    slanted_utf16_ranges.push(utf16_start as usize..utf16_end as usize);
+                }
                 let font = &self.fonts[run.font_id.0];
 
                 let font_metrics = font.metrics();
@@ -592,18 +664,17 @@ impl AppleTextSystemState {
                     .downcast::<CTFont>()
                     .unwrap()
             };
-            let font_id = self.id_for_native_font(font);
-
-            let glyphs = match runs.last_mut() {
-                Some(run) if run.font_id == font_id => &mut run.glyphs,
-                _ => {
-                    runs.push(ShapedRun {
-                        font_id,
-                        glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
-                    });
-                    &mut runs.last_mut().unwrap().glyphs
-                }
+            let is_italic_face = font.symbolic_traits().is_italic();
+            let face_font_id = self.id_for_native_font(font);
+            // CoreText reports the face it drew with, which is the upright one for a slanted run
+            // and may be a fallback face of another family.
+            let slanted_font_id = if slanted_utf16_ranges.is_empty() || is_italic_face {
+                face_font_id
+            } else {
+                self.slanted_font_id(face_font_id)
             };
+            let is_emoji = self.is_emoji(face_font_id);
+
             for ((&glyph_id, position), &glyph_utf16_ix) in run
                 .glyphs()
                 .iter()
@@ -616,11 +687,31 @@ impl AppleTextSystemState {
                     ix_converter = StringIndexConverter::new(text);
                 }
                 ix_converter.advance_to_utf16_ix(glyph_utf16_ix);
-                glyphs.push(ShapedGlyph {
+                let font_id = if slanted_utf16_ranges
+                    .iter()
+                    .any(|slanted| slanted.contains(&glyph_utf16_ix))
+                {
+                    slanted_font_id
+                } else {
+                    face_font_id
+                };
+                if runs
+                    .last()
+                    .is_none_or(|last_run| last_run.font_id != font_id)
+                {
+                    runs.push(ShapedRun {
+                        font_id,
+                        glyphs: Vec::with_capacity(run.glyph_count().try_into().unwrap_or(0)),
+                    });
+                }
+                let Some(shaped_run) = runs.last_mut() else {
+                    continue;
+                };
+                shaped_run.glyphs.push(ShapedGlyph {
                     id: GlyphId(glyph_id as u32),
                     position: point(position.x as f32, position.y as f32).map(px),
                     index: ix_converter.utf8_ix,
-                    is_emoji: self.is_emoji(font_id),
+                    is_emoji,
                 });
             }
         }
@@ -775,7 +866,10 @@ mod lenient_font_attributes {
 #[cfg(test)]
 mod tests {
     use crate::AppleTextSystem;
-    use gpui::{FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, font, px};
+    use gpui::{
+        FontFallbacks, FontFeatures, FontRun, GlyphId, PlatformTextSystem, RenderGlyphParams, font,
+        point, px,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -799,6 +893,101 @@ mod tests {
         );
         assert_eq!(layout.len, 6);
         assert!(!layout.runs.is_empty());
+    }
+
+    #[test]
+    fn test_italic_of_family_without_italic_face_is_slanted() {
+        let fonts = AppleTextSystem::new();
+        let upright = font("Apple SD Gothic Neo");
+        let upright_id = fonts.font_id(&upright).unwrap();
+        let slanted_id = fonts.font_id(&upright.clone().italic()).unwrap();
+        assert_ne!(upright_id, slanted_id);
+        assert_eq!(fonts.font_id(&upright.italic()).unwrap(), slanted_id);
+
+        let text = "한l";
+        let upright_layout = fonts.layout_line(
+            text,
+            px(32.),
+            &[FontRun {
+                font_id: upright_id,
+                len: text.len(),
+            }],
+        );
+        let slanted_layout = fonts.layout_line(
+            text,
+            px(32.),
+            &[FontRun {
+                font_id: slanted_id,
+                len: text.len(),
+            }],
+        );
+        assert_eq!(upright_layout.width, slanted_layout.width);
+        assert_eq!(upright_layout.runs.len(), 1);
+        assert_eq!(upright_layout.runs[0].font_id, upright_id);
+        assert_eq!(slanted_layout.runs.len(), 1);
+        assert_eq!(slanted_layout.runs[0].font_id, slanted_id);
+
+        let raster_bounds_of = |font_id| {
+            fonts
+                .glyph_raster_bounds(&RenderGlyphParams {
+                    font_id,
+                    glyph_id: upright_layout.runs[0].glyphs[0].id,
+                    font_size: px(32.),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 2.,
+                    is_emoji: false,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                })
+                .unwrap()
+        };
+        let upright_bounds = raster_bounds_of(upright_id);
+        let slanted_bounds = raster_bounds_of(slanted_id);
+        assert!(slanted_bounds.size.width > upright_bounds.size.width);
+        assert_eq!(slanted_bounds.size.height, upright_bounds.size.height);
+
+        let (bitmap_size, alpha) = fonts
+            .rasterize_glyph(
+                &RenderGlyphParams {
+                    font_id: slanted_id,
+                    glyph_id: slanted_layout.runs[0].glyphs[1].id,
+                    font_size: px(32.),
+                    subpixel_variant: point(0, 0),
+                    scale_factor: 2.,
+                    is_emoji: false,
+                    subpixel_rendering: false,
+                    dilation: 0,
+                },
+                fonts
+                    .glyph_raster_bounds(&RenderGlyphParams {
+                        font_id: slanted_id,
+                        glyph_id: slanted_layout.runs[0].glyphs[1].id,
+                        font_size: px(32.),
+                        subpixel_variant: point(0, 0),
+                        scale_factor: 2.,
+                        is_emoji: false,
+                        subpixel_rendering: false,
+                        dilation: 0,
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        let width = bitmap_size.width.0 as usize;
+        let ink_center_of_row = |row: usize| {
+            let inked_columns = (0..width)
+                .filter(|column| alpha[row * width + column] > 127)
+                .collect::<Vec<_>>();
+            inked_columns.iter().sum::<usize>() as f32 / inked_columns.len() as f32
+        };
+        let height = bitmap_size.height.0 as usize;
+        assert!(ink_center_of_row(height / 4) > ink_center_of_row(height * 3 / 4) + 2.);
+    }
+
+    #[test]
+    fn test_italic_face_of_family_is_not_slanted() {
+        let fonts = AppleTextSystem::new();
+        let italic_id = fonts.font_id(&font("Helvetica").italic()).unwrap();
+        assert!(!fonts.0.read().slanted_font_ids.contains(&italic_id));
     }
 
     #[test]

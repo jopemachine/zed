@@ -2568,6 +2568,11 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// Draws the window at this scale factor instead of its display's, and keeps the size it
+    /// was opened or resized with on a display smaller than it. A window rendered to an image
+    /// then has the same pixels whatever display the machine has (macOS only).
+    pub fixed_scale_factor: Option<f32>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2633,6 +2638,9 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fixed_scale_factor: Option<f32>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2694,6 +2702,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            fixed_scale_factor: None,
         }
     }
 }

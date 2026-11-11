@@ -82,6 +82,7 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const KEEPS_FRAME_SIZE_ON_SMALLER_SCREEN_IVAR: &str = "keepsFrameSizeOnSmallerScreen";
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
@@ -549,6 +550,12 @@ unsafe fn build_window_class(name: &'static str, superclass: &Class) -> *const C
             toggle_tab_bar as extern "C" fn(&Object, Sel, id),
         );
 
+        decl.add_ivar::<BOOL>(KEEPS_FRAME_SIZE_ON_SMALLER_SCREEN_IVAR);
+        decl.add_method(
+            sel!(constrainFrameRect:toScreen:),
+            constrain_frame_rect as extern "C" fn(&Object, Sel, NSRect, id) -> NSRect,
+        );
+
         decl.register()
     }
 }
@@ -712,6 +719,8 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    // Drawn at this scale factor instead of the screen's.
+    fixed_scale_factor: Option<f32>,
 }
 
 impl MacWindowState {
@@ -939,7 +948,8 @@ impl MacWindowState {
     }
 
     fn scale_factor(&self) -> f32 {
-        get_scale_factor(self.native_window)
+        self.fixed_scale_factor
+            .unwrap_or_else(|| get_scale_factor(self.native_window))
     }
 
     fn window_bounds(&self) -> WindowBounds {
@@ -973,6 +983,7 @@ impl MacWindow {
             display_id,
             window_min_size,
             tabbing_identifier,
+            fixed_scale_factor,
             ..
         }: WindowParams,
         cursor_visible: Arc<AtomicBool>,
@@ -1074,6 +1085,9 @@ impl MacWindow {
                 target_screen,
             );
             assert!(!native_window.is_null());
+            if fixed_scale_factor.is_some() {
+                (*native_window).set_ivar(KEEPS_FRAME_SIZE_ON_SMALLER_SCREEN_IVAR, YES);
+            }
             let () = msg_send![
                 native_window,
                 registerForDraggedTypes:
@@ -1148,6 +1162,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                fixed_scale_factor,
             }));
             let mut window = Self(state, marker);
 
@@ -3242,6 +3257,34 @@ extern "C" fn window_should_close(this: &Object, _: Sel, _: id) -> BOOL {
         should_close as BOOL
     } else {
         YES
+    }
+}
+
+/// AppKit makes a titled window no taller than its screen. A window with a fixed scale factor
+/// is rendered to an image of the size it was given, so it keeps that size and only takes the
+/// position AppKit chose. Read from an ivar because AppKit calls this while the window state
+/// is locked.
+extern "C" fn constrain_frame_rect(
+    this: &Object,
+    _: Sel,
+    frame_rect: NSRect,
+    screen: id,
+) -> NSRect {
+    unsafe {
+        let constrained: NSRect = msg_send![
+            super(this, class!(NSWindow)),
+            constrainFrameRect: frame_rect
+            toScreen: screen
+        ];
+        let keeps_frame_size: BOOL = *this.get_ivar(KEEPS_FRAME_SIZE_ON_SMALLER_SCREEN_IVAR);
+        if keeps_frame_size == NO {
+            return constrained;
+        }
+        let top = constrained.origin.y + constrained.size.height;
+        NSRect::new(
+            NSPoint::new(constrained.origin.x, top - frame_rect.size.height),
+            frame_rect.size,
+        )
     }
 }
 

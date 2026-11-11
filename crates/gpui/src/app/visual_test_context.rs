@@ -99,6 +99,30 @@ impl VisualTestAppContext {
         size: Size<Pixels>,
         build_root: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
     ) -> Result<WindowHandle<V>> {
+        self.open_offscreen_window_with(size, None, build_root)
+    }
+
+    /// Opens an off-screen window that draws at `scale_factor` whatever display the machine
+    /// has, and keeps `size` on a display smaller than it.
+    ///
+    /// What the window renders then has the same pixels on every display, which
+    /// [`Self::open_offscreen_window`] does not promise: there a window draws at its display's
+    /// scale factor and macOS makes it no taller than the display.
+    pub fn open_offscreen_window_at_scale_factor<V: Render + 'static>(
+        &mut self,
+        size: Size<Pixels>,
+        scale_factor: f32,
+        build_root: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> Result<WindowHandle<V>> {
+        self.open_offscreen_window_with(size, Some(scale_factor), build_root)
+    }
+
+    fn open_offscreen_window_with<V: Render + 'static>(
+        &mut self,
+        size: Size<Pixels>,
+        fixed_scale_factor: Option<f32>,
+        build_root: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+    ) -> Result<WindowHandle<V>> {
         use crate::{point, px};
 
         let bounds = Bounds {
@@ -112,6 +136,7 @@ impl VisualTestAppContext {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 focus: false,
                 show: true,
+                fixed_scale_factor,
                 ..Default::default()
             },
             build_root,

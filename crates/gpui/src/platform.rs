@@ -2744,6 +2744,11 @@ pub struct WindowOptions {
 
     /// Whether to render the window using the Display P3 color space on macOS.
     pub use_display_p3: bool,
+
+    /// Draws the window at this scale factor instead of its display's, and keeps the size it
+    /// was opened or resized with on a display smaller than it. A window rendered to an image
+    /// then has the same pixels whatever display the machine has (macOS only).
+    pub fixed_scale_factor: Option<f32>,
 }
 
 /// The variables that can be configured when creating a new window
@@ -2812,6 +2817,9 @@ pub struct WindowParams {
 
     #[cfg(target_os = "macos")]
     pub use_display_p3: bool,
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fixed_scale_factor: Option<f32>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -2877,6 +2885,7 @@ impl Default for WindowOptions {
             window_decorations: None,
             tabbing_identifier: None,
             use_display_p3: false,
+            fixed_scale_factor: None,
         }
     }
 }

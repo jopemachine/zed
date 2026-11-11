@@ -82,6 +82,11 @@ pub use prompts::*;
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
 
+/// How far from a device pixel boundary an edge may be and still count as lying on it when a
+/// region is widened to whole device pixels. `f32` arithmetic on the bounds of content scrolled
+/// by tens of thousands of pixels is off by about a hundredth of a device pixel.
+const DEVICE_PIXEL_EDGE_TOLERANCE: f32 = 1. / 32.;
+
 /// A 6:5 aspect ratio minimum window size to be used for functional,
 /// additional-to-main-Zed windows, like the settings and rules library windows.
 pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
@@ -3383,14 +3388,21 @@ impl Window {
         edges.map(|e| self.snap_stroke(*e))
     }
 
-    /// Floors the near edge and ceils the far edge, producing a strict superset of the raw region.
+    /// Floors the near edge and ceils the far edge, producing a superset of the raw region.
+    ///
+    /// An edge within [`DEVICE_PIXEL_EDGE_TOLERANCE`] of a device pixel boundary stays on that
+    /// boundary. Layout hands out bounds as whole device pixels divided by the scale factor, and
+    /// at a scale factor that is not a power of two, multiplying them back lands a hair to
+    /// either side of the pixel they came from. Flooring or ceiling that hair would cover a
+    /// whole device pixel the region does not touch.
     #[inline]
     fn cover_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
-        let left = floor_to_device_pixel(bounds.left().0, scale_factor);
-        let top = floor_to_device_pixel(bounds.top().0, scale_factor);
-        let right = ceil_to_device_pixel(bounds.right().0, scale_factor).max(left);
-        let bottom = ceil_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
+        let tolerance = DEVICE_PIXEL_EDGE_TOLERANCE / scale_factor;
+        let left = floor_to_device_pixel(bounds.left().0 + tolerance, scale_factor);
+        let top = floor_to_device_pixel(bounds.top().0 + tolerance, scale_factor);
+        let right = ceil_to_device_pixel(bounds.right().0 - tolerance, scale_factor).max(left);
+        let bottom = ceil_to_device_pixel(bounds.bottom().0 - tolerance, scale_factor).max(top);
         Bounds::from_corners(
             point(ScaledPixels(left), ScaledPixels(top)),
             point(ScaledPixels(right), ScaledPixels(bottom)),
@@ -3399,9 +3411,17 @@ impl Window {
 
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
-        ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+        let mask = self.content_mask().bounds;
+        let mut covered = self.cover_bounds(mask);
+        // A mask clipped to nothing still has a position. Covering the device pixel that
+        // position is inside would let a row or a column of pixels through.
+        if mask.size.width <= Pixels::ZERO {
+            covered.size.width = ScaledPixels(0.);
         }
+        if mask.size.height <= Pixels::ZERO {
+            covered.size.height = ScaledPixels(0.);
+        }
+        ContentMask { bounds: covered }
     }
 
     /// Call to prevent the default action of an event. Currently only used to prevent
@@ -8514,6 +8534,274 @@ mod tests {
             assert_eq!(window.viewport_size(), size(px(800.), px(600.)));
         })
         .unwrap();
+    }
+
+    #[test]
+    fn test_child_clipped_out_of_a_scroll_area_paints_nothing() {
+        struct ClippedOutCase {
+            name: &'static str,
+            scale_factor: f32,
+            content_scale: f32,
+            area_height: Pixels,
+            space_above_child: Pixels,
+            scroll_offset_y: Pixels,
+        }
+
+        struct ChildBelowScrollArea {
+            scroll_handle: crate::ScrollHandle,
+            area_height: Rc<Cell<Pixels>>,
+            space_above_child: Rc<Cell<Pixels>>,
+        }
+
+        impl Render for ChildBelowScrollArea {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .id("scroll-area")
+                        .w(px(100.))
+                        .h(self.area_height.get())
+                        .overflow_y_scroll()
+                        .track_scroll(&self.scroll_handle)
+                        .child(div().w(px(100.)).h(self.space_above_child.get()))
+                        .child(
+                            div()
+                                .w(px(100.))
+                                .h(px(40.))
+                                .overflow_hidden()
+                                .child(div().size_full().bg(hsla(0., 1., 0.5, 1.))),
+                        ),
+                )
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        let scroll_handle = crate::ScrollHandle::new();
+        let area_height = Rc::new(Cell::new(px(50.)));
+        let space_above_child = Rc::new(Cell::new(px(70.)));
+        let window = cx.add_window({
+            let scroll_handle = scroll_handle.clone();
+            let area_height = area_height.clone();
+            let space_above_child = space_above_child.clone();
+            move |_, _| ChildBelowScrollArea {
+                scroll_handle,
+                area_height,
+                space_above_child,
+            }
+        });
+        let handle: AnyWindowHandle = window.into();
+
+        let mut cases_painting_outside_the_area = Vec::new();
+        for case in [
+            ClippedOutCase {
+                name: "whole device rows",
+                scale_factor: 1.,
+                content_scale: 1.,
+                area_height: px(50.),
+                space_above_child: px(70.),
+                scroll_offset_y: px(-10.),
+            },
+            // Device row 79 is 71.818184 at a scale of 1.1, which is 79.00001 when multiplied back.
+            ClippedOutCase {
+                name: "a device row a content scale of 1.1 does not give back whole",
+                scale_factor: 1.,
+                content_scale: 1.1,
+                area_height: px(20.),
+                space_above_child: px(79. / 1.1),
+                scroll_offset_y: px(0.),
+            },
+            ClippedOutCase {
+                name: "the same row on a display with a scale factor of 2",
+                scale_factor: 2.,
+                content_scale: 1.1,
+                area_height: px(20.),
+                space_above_child: px(79. / 2.2),
+                scroll_offset_y: px(0.),
+            },
+            // Device row 57 is 32.57143 at a scale of 1.75, which is 57.000004 when multiplied
+            // back.
+            ClippedOutCase {
+                name: "a device row a display scale factor of 1.75 does not give back whole",
+                scale_factor: 1.75,
+                content_scale: 1.,
+                area_height: px(20.),
+                space_above_child: px(57. / 1.75),
+                scroll_offset_y: px(0.),
+            },
+        ] {
+            cx.simulate_window_scale_factor_change(handle, case.scale_factor);
+            area_height.set(case.area_height);
+            space_above_child.set(case.space_above_child);
+            let quads_painted = |cx: &mut TestAppContext, scroll_offset_y: Pixels| {
+                cx.update_window(handle, |_, window, cx| {
+                    window.set_content_scale(case.content_scale, cx);
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                    scroll_handle.set_offset(point(px(0.), scroll_offset_y));
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                    window.painted_quads()
+                })
+                .unwrap()
+            };
+
+            let painted_below_area = quads_painted(&mut cx, case.scroll_offset_y)
+                .iter()
+                .map(|quad| quad.bounds.intersect(&quad.content_mask.bounds))
+                .collect::<Vec<_>>();
+            if !painted_below_area.is_empty() {
+                cases_painting_outside_the_area.push((case.name, painted_below_area));
+            }
+
+            let quads_of_child_scrolled_to_top = quads_painted(&mut cx, -case.space_above_child);
+            assert_eq!(quads_of_child_scrolled_to_top.len(), 1, "{}", case.name);
+        }
+        assert_eq!(cases_painting_outside_the_area, Vec::new());
+    }
+
+    #[test]
+    fn test_empty_content_mask_inside_a_device_pixel_paints_nothing() {
+        struct MaskCase {
+            name: &'static str,
+            mask: Bounds<Pixels>,
+            expected_painted: Vec<Bounds<ScaledPixels>>,
+        }
+
+        struct QuadUnderMask(Rc<Cell<Bounds<Pixels>>>);
+
+        impl Render for QuadUnderMask {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mask = self.0.clone();
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        window
+                            .content_mask_stack
+                            .push(ContentMask { bounds: mask.get() });
+                        window.paint_quad(crate::fill(
+                            Bounds::from_corners(point(px(0.), px(0.)), point(px(200.), px(200.))),
+                            hsla(0., 1., 0.5, 1.),
+                        ));
+                        window.content_mask_stack.pop();
+                    },
+                )
+                .size_full()
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        let mask = Rc::new(Cell::new(Bounds::default()));
+        let window = cx.add_window({
+            let mask = mask.clone();
+            move |_, _| QuadUnderMask(mask)
+        });
+        let handle: AnyWindowHandle = window.into();
+        cx.simulate_window_scale_factor_change(handle, 1.);
+
+        for case in [
+            MaskCase {
+                name: "no height, halfway down a device row",
+                mask: Bounds::new(point(px(0.), px(60.5)), size(px(100.), px(0.))),
+                expected_painted: Vec::new(),
+            },
+            MaskCase {
+                name: "no width, halfway across a device column",
+                mask: Bounds::new(point(px(60.5), px(0.)), size(px(0.), px(100.))),
+                expected_painted: Vec::new(),
+            },
+            MaskCase {
+                name: "half a device row",
+                mask: Bounds::new(point(px(0.), px(60.25)), size(px(100.), px(0.5))),
+                expected_painted: vec![Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(60.)),
+                    size(ScaledPixels(100.), ScaledPixels(1.)),
+                )],
+            },
+        ] {
+            mask.set(case.mask);
+            let painted = cx
+                .update_window(handle, |_, window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                    window.painted_quads()
+                })
+                .unwrap()
+                .iter()
+                .map(|quad| quad.bounds.intersect(&quad.content_mask.bounds))
+                .collect::<Vec<_>>();
+            assert_eq!(painted, case.expected_painted, "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_cover_bounds_keeps_edges_that_lie_on_device_pixels() {
+        struct CoverCase {
+            name: &'static str,
+            scale_factor: f32,
+            bounds: Bounds<Pixels>,
+            expected: Bounds<ScaledPixels>,
+        }
+
+        let scaled_bounds = |left: f32, top: f32, right: f32, bottom: f32| {
+            Bounds::from_corners(
+                point(ScaledPixels(left), ScaledPixels(top)),
+                point(ScaledPixels(right), ScaledPixels(bottom)),
+            )
+        };
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, _| EmptyView);
+        let handle: AnyWindowHandle = window.into();
+
+        for case in [
+            CoverCase {
+                name: "whole device pixels",
+                scale_factor: 1.,
+                bounds: Bounds::from_corners(point(px(10.), px(20.)), point(px(30.), px(40.))),
+                expected: scaled_bounds(10., 20., 30., 40.),
+            },
+            CoverCase {
+                name: "edges inside device pixels cover them",
+                scale_factor: 1.,
+                bounds: Bounds::from_corners(
+                    point(px(10.25), px(20.5)),
+                    point(px(30.25), px(40.75)),
+                ),
+                expected: scaled_bounds(10., 20., 31., 41.),
+            },
+            CoverCase {
+                name: "edges inside device pixels cover them at a scale factor of 2",
+                scale_factor: 2.,
+                bounds: Bounds::from_corners(
+                    point(px(10.25), px(20.4)),
+                    point(px(30.25), px(40.4)),
+                ),
+                expected: scaled_bounds(20., 40., 61., 81.),
+            },
+            CoverCase {
+                name: "edges within the tolerance of a device pixel boundary stay on it",
+                scale_factor: 1.,
+                bounds: Bounds::from_corners(
+                    point(px(10.99), px(20.01)),
+                    point(px(30.01), px(39.99)),
+                ),
+                expected: scaled_bounds(11., 20., 30., 40.),
+            },
+            // 45 / 1.1 * 1.1 is 44.999996 and 79 / 1.1 * 1.1 is 79.00001.
+            CoverCase {
+                name: "device pixels the scale factor does not give back whole",
+                scale_factor: 1.1,
+                bounds: Bounds::from_corners(
+                    point(px(45. / 1.1), px(45. / 1.1)),
+                    point(px(79. / 1.1), px(79. / 1.1)),
+                ),
+                expected: scaled_bounds(45., 45., 79., 79.),
+            },
+        ] {
+            cx.simulate_window_scale_factor_change(handle, case.scale_factor);
+            let covered = cx
+                .update_window(handle, |_, window, _| window.cover_bounds(case.bounds))
+                .unwrap();
+            assert_eq!(covered, case.expected, "{}", case.name);
+        }
     }
 
     #[test]

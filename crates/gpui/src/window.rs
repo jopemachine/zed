@@ -1600,6 +1600,7 @@ impl Window {
             icon,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
+            fixed_scale_factor,
         } = options;
 
         let initial_window_title = titlebar
@@ -1625,6 +1626,7 @@ impl Window {
                 icon,
                 #[cfg(target_os = "macos")]
                 tabbing_identifier,
+                fixed_scale_factor,
             },
         )?;
 

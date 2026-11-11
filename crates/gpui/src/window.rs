@@ -8627,6 +8627,39 @@ mod tests {
                 space_above_child: px(57. / 1.75),
                 scroll_offset_y: px(0.),
             },
+            // A window can undo its display's scale factor with a content scale below 1.
+            ClippedOutCase {
+                name: "whole device rows at a content scale of 0.5",
+                scale_factor: 1.,
+                content_scale: 0.5,
+                area_height: px(20.),
+                space_above_child: px(79. / 0.5),
+                scroll_offset_y: px(0.),
+            },
+            ClippedOutCase {
+                name: "a display scale factor of 2 undone by a content scale of 0.5",
+                scale_factor: 2.,
+                content_scale: 0.5,
+                area_height: px(20.),
+                space_above_child: px(79.),
+                scroll_offset_y: px(0.),
+            },
+            ClippedOutCase {
+                name: "a device row a content scale of 0.55 does not give back whole",
+                scale_factor: 1.,
+                content_scale: 0.55,
+                area_height: px(20.),
+                space_above_child: px(79. / 0.55),
+                scroll_offset_y: px(0.),
+            },
+            ClippedOutCase {
+                name: "the same row on a display with a scale factor of 2 drawn at 1.1",
+                scale_factor: 2.,
+                content_scale: 0.55,
+                area_height: px(20.),
+                space_above_child: px(79. / 1.1),
+                scroll_offset_y: px(0.),
+            },
         ] {
             cx.simulate_window_scale_factor_change(handle, case.scale_factor);
             area_height.set(case.area_height);
@@ -8662,6 +8695,7 @@ mod tests {
     fn test_empty_content_mask_inside_a_device_pixel_paints_nothing() {
         struct MaskCase {
             name: &'static str,
+            content_scale: f32,
             mask: Bounds<Pixels>,
             expected_painted: Vec<Bounds<ScaledPixels>>,
         }
@@ -8700,26 +8734,45 @@ mod tests {
         for case in [
             MaskCase {
                 name: "no height, halfway down a device row",
+                content_scale: 1.,
                 mask: Bounds::new(point(px(0.), px(60.5)), size(px(100.), px(0.))),
                 expected_painted: Vec::new(),
             },
             MaskCase {
                 name: "no width, halfway across a device column",
+                content_scale: 1.,
                 mask: Bounds::new(point(px(60.5), px(0.)), size(px(0.), px(100.))),
                 expected_painted: Vec::new(),
             },
             MaskCase {
                 name: "half a device row",
+                content_scale: 1.,
                 mask: Bounds::new(point(px(0.), px(60.25)), size(px(100.), px(0.5))),
                 expected_painted: vec![Bounds::new(
                     point(ScaledPixels(0.), ScaledPixels(60.)),
                     size(ScaledPixels(100.), ScaledPixels(1.)),
                 )],
             },
+            MaskCase {
+                name: "no height, halfway down a device row at a content scale of 0.5",
+                content_scale: 0.5,
+                mask: Bounds::new(point(px(0.), px(61.)), size(px(100.), px(0.))),
+                expected_painted: Vec::new(),
+            },
+            MaskCase {
+                name: "half a device row at a content scale of 0.5",
+                content_scale: 0.5,
+                mask: Bounds::new(point(px(0.), px(60.5)), size(px(100.), px(1.))),
+                expected_painted: vec![Bounds::new(
+                    point(ScaledPixels(0.), ScaledPixels(30.)),
+                    size(ScaledPixels(50.), ScaledPixels(1.)),
+                )],
+            },
         ] {
             mask.set(case.mask);
             let painted = cx
                 .update_window(handle, |_, window, cx| {
+                    window.set_content_scale(case.content_scale, cx);
                     window.refresh();
                     window.draw(cx).clear(cx);
                     window.painted_quads()
@@ -8784,6 +8837,22 @@ mod tests {
                     point(px(30.01), px(39.99)),
                 ),
                 expected: scaled_bounds(11., 20., 30., 40.),
+            },
+            CoverCase {
+                name: "edges inside device pixels cover them at a scale factor of 0.5",
+                scale_factor: 0.5,
+                bounds: Bounds::from_corners(point(px(11.), px(20.)), point(px(31.), px(40.))),
+                expected: scaled_bounds(5., 10., 16., 20.),
+            },
+            // 45 / 0.55 * 0.55 is 44.999996 and 79 / 0.55 * 0.55 is 79.00001.
+            CoverCase {
+                name: "device pixels a scale factor of 0.55 does not give back whole",
+                scale_factor: 0.55,
+                bounds: Bounds::from_corners(
+                    point(px(45. / 0.55), px(45. / 0.55)),
+                    point(px(79. / 0.55), px(79. / 0.55)),
+                ),
+                expected: scaled_bounds(45., 45., 79., 79.),
             },
             // 45 / 1.1 * 1.1 is 44.999996 and 79 / 1.1 * 1.1 is 79.00001.
             CoverCase {

@@ -2078,6 +2078,9 @@ impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 state.serial_tracker.update(SerialKind::Touch, serial);
+                // A finger on the screen means the pointer is not in use: hide its cursor until the mouse moves
+                // again, so that a plugged-in mouse does not leave its cursor over what the finger touches.
+                state.hide_cursor_until_mouse_moves();
                 let touch_id = TouchId(id as u64);
                 // Only `Down` carries the touched surface; remember it so the
                 // follow-up Motion/Up events for this id can be routed to the

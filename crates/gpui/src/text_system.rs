@@ -32,7 +32,7 @@ use std::{
     ops::{Deref, DerefMut, Range},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -238,6 +238,18 @@ pub struct TextSystem {
     font_generation: Arc<AtomicUsize>,
     missing_glyph_reporter: Arc<MissingGlyphReporter>,
     missing_glyph_receiver: Mutex<Option<MissingGlyphReceiver>>,
+    glyphs_dilated_by_font_smoothing: AtomicBool,
+}
+
+/// How glyph strokes are drawn, as CSS `-webkit-font-smoothing` chooses on macOS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FontSmoothing {
+    /// The platform's smoothing. On macOS it thickens strokes by an amount that depends on the
+    /// color of the text, unless the user turned font smoothing off.
+    #[default]
+    Platform,
+    /// Grayscale antialiasing without thickened strokes, as `-webkit-font-smoothing: antialiased`.
+    Antialiased,
 }
 
 impl TextSystem {
@@ -275,7 +287,26 @@ impl TextSystem {
                 generation: missing_glyph_generation,
                 receiver,
             })),
+            glyphs_dilated_by_font_smoothing: AtomicBool::new(true),
         }
+    }
+
+    /// Chooses how glyph strokes are drawn from now on. Glyphs already drawn keep their strokes
+    /// until the window draws them again.
+    pub fn set_font_smoothing(&self, smoothing: FontSmoothing) {
+        self.glyphs_dilated_by_font_smoothing
+            .store(smoothing == FontSmoothing::Platform, Ordering::Release);
+    }
+
+    /// Chooses whether a style a family has no face for is drawn from another face, as CSS
+    /// `font-synthesis: style` and `font-synthesis: none` choose. With synthesis, italic text in a
+    /// family without an italic face is drawn slanted; without it, upright. Cached font resolution
+    /// is invalidated.
+    pub fn set_font_style_synthesis(&self, synthesized: bool) {
+        self.platform_text_system
+            .set_font_style_synthesis(synthesized);
+        self.font_ids_by_font.write().clear();
+        self.font_generation.fetch_add(1, Ordering::Release);
     }
 
     /// Get sorted, unique font family names available to the platform text system.
@@ -582,6 +613,12 @@ impl TextSystem {
 
     /// Returns the dilation level to use for a glyph painted in the given color.
     pub(crate) fn glyph_dilation_for_color(&self, color: Hsla) -> u8 {
+        if !self
+            .glyphs_dilated_by_font_smoothing
+            .load(Ordering::Acquire)
+        {
+            return 0;
+        }
         self.platform_text_system.glyph_dilation_for_color(color)
     }
 

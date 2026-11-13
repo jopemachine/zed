@@ -1526,6 +1526,9 @@ pub trait PlatformTextSystem: Send + Sync {
     fn glyph_dilation_for_color(&self, _color: Hsla) -> u8 {
         0
     }
+    /// Chooses whether a style a family has no face for is drawn from another face. Fonts
+    /// resolved afterwards follow the choice.
+    fn set_font_style_synthesis(&self, _synthesized: bool) {}
 }
 
 #[expect(missing_docs)]

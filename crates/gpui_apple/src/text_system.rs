@@ -85,6 +85,7 @@ struct AppleTextSystemState {
     /// a family without an italic face resolve to these.
     slanted_font_ids_by_upright_font_id: HashMap<FontId, FontId>,
     slanted_font_ids: HashSet<FontId>,
+    synthesizes_font_styles: bool,
 }
 
 impl AppleTextSystem {
@@ -100,6 +101,7 @@ impl AppleTextSystem {
             postscript_names_by_font_id: HashMap::default(),
             slanted_font_ids_by_upright_font_id: HashMap::default(),
             slanted_font_ids: HashSet::default(),
+            synthesizes_font_styles: true,
         }))
     }
 }
@@ -149,6 +151,14 @@ impl PlatformTextSystem for AppleTextSystem {
         names
     }
 
+    fn set_font_style_synthesis(&self, synthesized: bool) {
+        let mut lock = self.0.write();
+        if lock.synthesizes_font_styles != synthesized {
+            lock.synthesizes_font_styles = synthesized;
+            lock.font_selections.clear();
+        }
+    }
+
     fn font_id(&self, font: &Font) -> Result<FontId> {
         let lock = self.0.upgradable_read();
         if let Some(font_id) = lock.font_selections.get(font) {
@@ -184,7 +194,8 @@ impl PlatformTextSystem for AppleTextSystem {
             )?;
 
             let font_id = candidates[ix];
-            let font_id = if font.style != FontStyle::Normal
+            let font_id = if lock.synthesizes_font_styles
+                && font.style != FontStyle::Normal
                 && candidate_properties[ix].style == FontkitStyle::Normal
             {
                 lock.slanted_font_id(font_id)
@@ -981,6 +992,21 @@ mod tests {
         };
         let height = bitmap_size.height.0 as usize;
         assert!(ink_center_of_row(height / 4) > ink_center_of_row(height * 3 / 4) + 2.);
+    }
+
+    #[test]
+    fn test_italic_of_family_without_italic_face_is_upright_without_style_synthesis() {
+        let fonts = AppleTextSystem::new();
+        let upright = font("Apple SD Gothic Neo");
+        let slanted_id = fonts.font_id(&upright.clone().italic()).unwrap();
+        fonts.set_font_style_synthesis(false);
+        let upright_id = fonts.font_id(&upright.clone()).unwrap();
+        assert_eq!(
+            fonts.font_id(&upright.clone().italic()).unwrap(),
+            upright_id
+        );
+        fonts.set_font_style_synthesis(true);
+        assert_eq!(fonts.font_id(&upright.italic()).unwrap(), slanted_id);
     }
 
     #[test]

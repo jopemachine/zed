@@ -567,6 +567,20 @@ struct QuadVarying {
     @location(2) @interpolate(flat) background_color0: vec4<f32>,
     @location(3) @interpolate(flat) background_color1: vec4<f32>,
     @location(4) @interpolate(flat) background_tag: u32,
+    @location(5) @interpolate(flat) bounds: vec4<f32>,
+    @location(6) @interpolate(flat) corner_radii: vec4<f32>,
+    @location(7) @interpolate(flat) border_widths: vec4<f32>,
+    @location(8) @interpolate(flat) border_style: u32,
+}
+
+// The parts of a quad the fragment shader reads for every pixel. They arrive as flat varyings: a storage
+// buffer read per fragment costs a memory lookup on tile-based GPUs such as V3D, and large quads cover
+// most of the screen.
+struct QuadShape {
+    bounds: Bounds,
+    corner_radii: Corners,
+    border_widths: Edges,
+    border_style: u32,
 }
 
 @vertex
@@ -591,6 +605,12 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.background_color0 = background.color0;
     out.background_color1 = background.color1;
     out.background_tag = background.tag;
+    out.bounds = vec4<f32>(quad.bounds.origin, quad.bounds.size);
+    out.corner_radii = vec4<f32>(quad.corner_radii.top_left, quad.corner_radii.top_right,
+        quad.corner_radii.bottom_right, quad.corner_radii.bottom_left);
+    out.border_widths = vec4<f32>(quad.border_widths.top, quad.border_widths.right,
+        quad.border_widths.bottom, quad.border_widths.left);
+    out.border_style = quad.border_style;
     return out;
 }
 
@@ -600,10 +620,20 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         return blend_color(input.background_color0, 1.0);
     }
 
-    let quad = load_quad(input.quad_id);
-    let prepared = PreparedBackground(input.background_color0, input.background_color1,
-        input.background_tag);
-    let background = background_color(prepared, quad.background, quad.bounds, input.position.xy);
+    let quad = QuadShape(
+        Bounds(input.bounds.xy, input.bounds.zw),
+        Corners(input.corner_radii.x, input.corner_radii.y, input.corner_radii.z, input.corner_radii.w),
+        Edges(input.border_widths.x, input.border_widths.y, input.border_widths.z, input.border_widths.w),
+        input.border_style,
+    );
+    // Only gradient and pattern backgrounds read the rest of the quad.
+    var background = input.background_color0;
+    if (input.background_tag != 0u) {
+        let prepared = PreparedBackground(input.background_color0, input.background_color1,
+            input.background_tag);
+        background = background_color(prepared, load_quad(input.quad_id).background, quad.bounds,
+            input.position.xy);
+    }
     let unrounded = !has_rounded_corners(quad.corner_radii);
 
     let size = quad.bounds.size;
@@ -1015,11 +1045,26 @@ struct Shadow {
 struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
-    @location(1) @interpolate(flat) shadow_id: u32,
     @location(2) @interpolate(flat) blur_shape: vec4<f32>,
     @location(3) @interpolate(flat) blur_r1: vec4<f32>,
     @location(4) @interpolate(flat) blur_exponent: vec4<f32>,
     @location(5) @interpolate(flat) blur_scale: vec4<f32>,
+    @location(6) @interpolate(flat) bounds: vec4<f32>,
+    @location(7) @interpolate(flat) corner_radii: vec4<f32>,
+    @location(8) @interpolate(flat) shape_bounds: vec4<f32>,
+    @location(9) @interpolate(flat) shape_corner_radii: vec4<f32>,
+    @location(10) @interpolate(flat) blur_radius: f32,
+    @location(11) @interpolate(flat) inset: u32,
+}
+
+// The parts of a shadow the fragment shader reads for every pixel, passed as flat varyings like `QuadShape`.
+struct ShadowShape {
+    blur_radius: f32,
+    bounds: Bounds,
+    corner_radii: Corners,
+    shape_bounds: Bounds,
+    shape_corner_radii: Corners,
+    inset: u32,
 }
 
 struct PreparedBlurredRoundedRect {
@@ -1095,19 +1140,35 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     let clipped = clip_to_mask(unit_vertex, shadow.bounds, shadow.content_mask);
     out.position = to_device_position_impl(clipped.position);
     out.color = hsla_to_rgba(shadow.color);
-    out.shadow_id = instance_id;
     let blur = prepare_blurred_rounded_rect(shadow.shape_bounds.size, shadow.shape_corner_radii,
                                             shadow.blur_radius);
     out.blur_shape = blur.shape;
     out.blur_r1 = blur.r1;
     out.blur_exponent = blur.exponent;
     out.blur_scale = blur.scale;
+    out.bounds = vec4<f32>(shadow.bounds.origin, shadow.bounds.size);
+    out.corner_radii = vec4<f32>(shadow.corner_radii.top_left, shadow.corner_radii.top_right,
+        shadow.corner_radii.bottom_right, shadow.corner_radii.bottom_left);
+    out.shape_bounds = vec4<f32>(shadow.shape_bounds.origin, shadow.shape_bounds.size);
+    out.shape_corner_radii = vec4<f32>(shadow.shape_corner_radii.top_left,
+        shadow.shape_corner_radii.top_right, shadow.shape_corner_radii.bottom_right,
+        shadow.shape_corner_radii.bottom_left);
+    out.blur_radius = shadow.blur_radius;
+    out.inset = shadow.inset;
     return out;
 }
 
 @fragment
 fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
-    let shadow = load_shadow(input.shadow_id);
+    let shadow = ShadowShape(
+        input.blur_radius,
+        Bounds(input.bounds.xy, input.bounds.zw),
+        Corners(input.corner_radii.x, input.corner_radii.y, input.corner_radii.z, input.corner_radii.w),
+        Bounds(input.shape_bounds.xy, input.shape_bounds.zw),
+        Corners(input.shape_corner_radii.x, input.shape_corner_radii.y, input.shape_corner_radii.z,
+            input.shape_corner_radii.w),
+        input.inset,
+    );
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
@@ -1428,6 +1489,10 @@ struct PolySpriteVarying {
     @location(0) tile_position: vec2<f32>,
     @location(1) @interpolate(flat) sprite_id: u32,
     @location(2) @interpolate(flat) opacity: f32,
+    // The sprite's shape, passed as flat varyings like `QuadShape`.
+    @location(3) @interpolate(flat) bounds: vec4<f32>,
+    @location(4) @interpolate(flat) corner_radii: vec4<f32>,
+    @location(5) @interpolate(flat) grayscale: u32,
 }
 
 @vertex
@@ -1442,6 +1507,10 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     let simple = !has_rounded_corners(sprite.corner_radii) && sprite.grayscale == 0u;
     out.sprite_id = instance_id | select(0u, SIMPLE_PRIMITIVE_FLAG, simple);
     out.opacity = sprite.opacity;
+    out.bounds = vec4<f32>(sprite.bounds.origin, sprite.bounds.size);
+    out.corner_radii = vec4<f32>(sprite.corner_radii.top_left, sprite.corner_radii.top_right,
+        sprite.corner_radii.bottom_right, sprite.corner_radii.bottom_left);
+    out.grayscale = sprite.grayscale;
     return out;
 }
 
@@ -1452,11 +1521,13 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         return blend_color(color, input.opacity);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
-    if (sprite.grayscale != 0u) {
+    if (input.grayscale != 0u) {
         color = vec4<f32>(vec3<f32>(dot(color.rgb, GRAYSCALE_FACTORS)), color.a);
     }
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let bounds = Bounds(input.bounds.xy, input.bounds.zw);
+    let corner_radii = Corners(input.corner_radii.x, input.corner_radii.y, input.corner_radii.z,
+        input.corner_radii.w);
+    let distance = quad_sdf(input.position.xy, bounds, corner_radii);
     return blend_color(color, input.opacity * saturate(0.5 - distance));
 }
 

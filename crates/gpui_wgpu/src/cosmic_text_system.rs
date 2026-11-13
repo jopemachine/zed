@@ -64,6 +64,7 @@ struct CosmicTextSystemState {
     /// Ids that draw an upright face slanted, by the id of the upright face. Italic requests for
     /// a family without an italic face resolve to these.
     slanted_font_ids_by_upright_font_id: HashMap<FontId, FontId>,
+    synthesizes_font_styles: bool,
     system_font_fallback: String,
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
 }
@@ -149,6 +150,7 @@ impl CosmicTextSystem {
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
             slanted_font_ids_by_upright_font_id: HashMap::default(),
+            synthesizes_font_styles: true,
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
         }))
@@ -169,6 +171,7 @@ impl CosmicTextSystem {
             loaded_font_ids_by_key: HashMap::default(),
             font_ids_by_family_cache: HashMap::default(),
             slanted_font_ids_by_upright_font_id: HashMap::default(),
+            synthesizes_font_styles: true,
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
         }))
@@ -182,6 +185,10 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
         self.0.write().missing_glyph_sink = sink;
+    }
+
+    fn set_font_style_synthesis(&self, synthesized: bool) {
+        self.0.write().synthesizes_font_styles = synthesized;
     }
 
     fn all_font_names(&self) -> Vec<String> {
@@ -217,7 +224,10 @@ impl PlatformTextSystem for CosmicTextSystem {
         let ix = find_best_match(font, candidates, &state)?;
         let font_id = candidates[ix];
 
-        if font.style != gpui::FontStyle::Normal && state.is_upright_face(font_id) {
+        if state.synthesizes_font_styles
+            && font.style != gpui::FontStyle::Normal
+            && state.is_upright_face(font_id)
+        {
             Ok(state.slanted_font_id(font_id))
         } else {
             Ok(font_id)

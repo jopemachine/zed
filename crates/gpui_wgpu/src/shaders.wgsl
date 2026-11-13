@@ -536,6 +536,20 @@ struct QuadVarying {
     @location(3) @interpolate(flat) background_solid: vec4<f32>,
     @location(4) @interpolate(flat) background_color0: vec4<f32>,
     @location(5) @interpolate(flat) background_color1: vec4<f32>,
+    @location(6) @interpolate(flat) bounds: vec4<f32>,
+    @location(7) @interpolate(flat) corner_radii: vec4<f32>,
+    @location(8) @interpolate(flat) border_widths: vec4<f32>,
+    @location(9) @interpolate(flat) border_style_and_background_tag: vec2<u32>,
+}
+
+// The parts of a quad the fragment shader reads for every pixel. They arrive as flat varyings: a storage
+// buffer read per fragment costs a memory lookup on tile-based GPUs such as V3D, and large quads cover
+// most of the screen.
+struct QuadShape {
+    bounds: Bounds,
+    corner_radii: Corners,
+    border_widths: Edges,
+    border_style: u32,
 }
 
 @vertex
@@ -558,6 +572,12 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     out.border_color = hsla_to_rgba(quad.border_color);
     out.quad_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, quad.bounds, quad.content_mask);
+    out.bounds = vec4<f32>(quad.bounds.origin, quad.bounds.size);
+    out.corner_radii = vec4<f32>(quad.corner_radii.top_left, quad.corner_radii.top_right,
+        quad.corner_radii.bottom_right, quad.corner_radii.bottom_left);
+    out.border_widths = vec4<f32>(quad.border_widths.top, quad.border_widths.right,
+        quad.border_widths.bottom, quad.border_widths.left);
+    out.border_style_and_background_tag = vec2<u32>(quad.border_style, quad.background.tag);
     return out;
 }
 
@@ -568,10 +588,18 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let quad = load_quad(input.quad_id);
+    let quad = QuadShape(
+        Bounds(input.bounds.xy, input.bounds.zw),
+        Corners(input.corner_radii.x, input.corner_radii.y, input.corner_radii.z, input.corner_radii.w),
+        Edges(input.border_widths.x, input.border_widths.y, input.border_widths.z, input.border_widths.w),
+        input.border_style_and_background_tag.x,
+    );
 
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
-        input.background_solid, input.background_color0, input.background_color1);
+    var background_color = input.background_solid;
+    if (input.border_style_and_background_tag.y != 0u) {
+        background_color = gradient_color(load_quad(input.quad_id).background, input.position.xy, quad.bounds,
+            input.background_solid, input.background_color0, input.background_color1);
+    }
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.bottom_left == 0.0 &&
@@ -967,9 +995,24 @@ struct Shadow {
 struct ShadowVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) @interpolate(flat) color: vec4<f32>,
-    @location(1) @interpolate(flat) shadow_id: u32,
     //TODO: use `clip_distance` once Naga supports it
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) bounds: vec4<f32>,
+    @location(5) @interpolate(flat) corner_radii: vec4<f32>,
+    @location(6) @interpolate(flat) element_bounds: vec4<f32>,
+    @location(7) @interpolate(flat) element_corner_radii: vec4<f32>,
+    @location(8) @interpolate(flat) blur_radius: f32,
+    @location(9) @interpolate(flat) inset: u32,
+}
+
+// The parts of a shadow the fragment shader reads for every pixel, passed as flat varyings like `QuadShape`.
+struct ShadowShape {
+    bounds: Bounds,
+    corner_radii: Corners,
+    element_bounds: Bounds,
+    element_corner_radii: Corners,
+    blur_radius: f32,
+    inset: u32,
 }
 
 @vertex
@@ -991,8 +1034,16 @@ fn vs_shadow(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) ins
     var out = ShadowVarying();
     out.position = to_device_position(unit_vertex, geometry);
     out.color = hsla_to_rgba(shadow.color);
-    out.shadow_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, geometry, shadow.content_mask);
+    out.bounds = vec4<f32>(shadow.bounds.origin, shadow.bounds.size);
+    out.corner_radii = vec4<f32>(shadow.corner_radii.top_left, shadow.corner_radii.top_right,
+        shadow.corner_radii.bottom_right, shadow.corner_radii.bottom_left);
+    out.element_bounds = vec4<f32>(shadow.element_bounds.origin, shadow.element_bounds.size);
+    out.element_corner_radii = vec4<f32>(shadow.element_corner_radii.top_left,
+        shadow.element_corner_radii.top_right, shadow.element_corner_radii.bottom_right,
+        shadow.element_corner_radii.bottom_left);
+    out.blur_radius = shadow.blur_radius;
+    out.inset = shadow.inset;
     return out;
 }
 
@@ -1003,7 +1054,15 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let shadow = load_shadow(input.shadow_id);
+    let shadow = ShadowShape(
+        Bounds(input.bounds.xy, input.bounds.zw),
+        Corners(input.corner_radii.x, input.corner_radii.y, input.corner_radii.z, input.corner_radii.w),
+        Bounds(input.element_bounds.xy, input.element_bounds.zw),
+        Corners(input.element_corner_radii.x, input.element_corner_radii.y, input.element_corner_radii.z,
+            input.element_corner_radii.w),
+        input.blur_radius,
+        input.inset,
+    );
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
     let center_to_point = input.position.xy - center;
@@ -1274,8 +1333,11 @@ struct PolychromeSprite {
 struct PolySpriteVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) tile_position: vec2<f32>,
-    @location(1) @interpolate(flat) sprite_id: u32,
     @location(3) clip_distances: vec4<f32>,
+    @location(4) @interpolate(flat) bounds: vec4<f32>,
+    @location(5) @interpolate(flat) corner_radii: vec4<f32>,
+    @location(6) @interpolate(flat) grayscale: u32,
+    @location(7) @interpolate(flat) opacity: f32,
 }
 
 @vertex
@@ -1286,8 +1348,12 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
     var out = PolySpriteVarying();
     out.position = to_device_position(unit_vertex, sprite.bounds);
     out.tile_position = to_tile_position(unit_vertex, sprite.tile);
-    out.sprite_id = instance_id;
     out.clip_distances = distance_from_clip_rect(unit_vertex, sprite.bounds, sprite.content_mask);
+    out.bounds = vec4<f32>(sprite.bounds.origin, sprite.bounds.size);
+    out.corner_radii = vec4<f32>(sprite.corner_radii.top_left, sprite.corner_radii.top_right,
+        sprite.corner_radii.bottom_right, sprite.corner_radii.bottom_left);
+    out.grayscale = sprite.grayscale;
+    out.opacity = sprite.opacity;
     return out;
 }
 
@@ -1299,15 +1365,16 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let bounds = Bounds(input.bounds.xy, input.bounds.zw);
+    let corner_radii = Corners(input.corner_radii.x, input.corner_radii.y, input.corner_radii.z, input.corner_radii.w);
+    let distance = quad_sdf(input.position.xy, bounds, corner_radii);
 
     var color = sample;
-    if (sprite.grayscale != 0u) {
+    if (input.grayscale != 0u) {
         let grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = vec4<f32>(vec3<f32>(grayscale), sample.a);
     }
-    return blend_color(color, sprite.opacity * saturate(0.5 - distance));
+    return blend_color(color, input.opacity * saturate(0.5 - distance));
 }
 
 // --- surfaces --- //

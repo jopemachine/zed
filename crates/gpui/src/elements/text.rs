@@ -1,9 +1,10 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size, TextOverflow,
-    TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window, WrappedLine,
-    WrappedLineLayout, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    MeasuredSizeRounding, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
+    SharedString, Size, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace,
+    Window, WrappedLine, WrappedLineLayout, px, register_tooltip_mouse_handlers,
+    set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -771,8 +772,12 @@ impl TextLayout {
                 for line in &lines {
                     let line_size = line.size(line_height);
                     size.height += line_size.height;
-                    size.width = size.width.max(line_size.width).ceil();
+                    size.width = size.width.max(line_size.width);
                 }
+                size.width = match cx.measured_size_rounding() {
+                    MeasuredSizeRounding::DevicePixel => size.width.ceil(),
+                    MeasuredSizeRounding::Fractional => Self::layout_unit_above(size.width),
+                };
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {
                     lines,
@@ -787,6 +792,16 @@ impl TextLayout {
                 size
             }
         })
+    }
+
+    /// The smallest multiple of 1/64 of a point above `width`, or nothing for no width. Laying the
+    /// text out at the width it measured comes back through device pixels with rounding errors;
+    /// being above the width keeps them from wrapping its last word.
+    fn layout_unit_above(width: Pixels) -> Pixels {
+        if width <= px(0.) {
+            return px(0.);
+        }
+        px(((width.0 * 64.).floor() + 1.) / 64.)
     }
 
     fn prepaint(&self, bounds: Bounds<Pixels>, text: &str) {
@@ -1347,5 +1362,35 @@ mod tests {
             make_text_unstable_id(false).id,
             make_text_unstable_id(true).id
         );
+    }
+
+    #[derive(Debug)]
+    struct LayoutUnitCase {
+        width: f32,
+        layout_width: f32,
+    }
+
+    #[test]
+    fn test_layout_unit_above_a_measured_width() {
+        for case in [
+            LayoutUnitCase {
+                width: 0.,
+                layout_width: 0.,
+            },
+            LayoutUnitCase {
+                width: 63.07,
+                layout_width: 63.078125,
+            },
+            LayoutUnitCase {
+                width: 63.078125,
+                layout_width: 63.09375,
+            },
+        ] {
+            assert_eq!(
+                TextLayout::layout_unit_above(px(case.width)),
+                px(case.layout_width),
+                "{case:?}"
+            );
+        }
     }
 }

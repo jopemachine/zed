@@ -810,6 +810,19 @@ enum PlatformOwnedDragState {
     RestoredInSourceWindow,
 }
 
+/// How layout rounds the size an element measured itself at, such as the size of a text.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum MeasuredSizeRounding {
+    /// Up to whole device pixels, after a text's width is rounded up to a whole point.
+    #[default]
+    DevicePixel,
+    /// As measured, as a browser lays out boxes in fractions of a pixel. A text's width is rounded
+    /// up to the next 1/64 of a point, as Chromium's `LayoutUnit` holds it, so the text laid out at
+    /// that width keeps its lines. Each element's edges are still snapped to device pixels after
+    /// layout.
+    Fractional,
+}
+
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
 /// Other [Context] derefs to this type.
 /// You need a reference to an `App` to access the state of a [Entity].
@@ -895,6 +908,7 @@ pub struct App {
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
+    measured_size_rounding: MeasuredSizeRounding,
 
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
@@ -946,6 +960,7 @@ impl App {
                 platform: platform.clone(),
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
+                measured_size_rounding: MeasuredSizeRounding::default(),
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
                 pending_updates: 0,
@@ -1744,6 +1759,17 @@ impl App {
     /// Returns the current text rendering mode for the application.
     pub fn text_rendering_mode(&self) -> TextRenderingMode {
         self.text_rendering_mode.get()
+    }
+
+    /// Chooses how layout rounds the sizes elements measure themselves at, such as the width
+    /// of a text, from the next layout on.
+    pub fn set_measured_size_rounding(&mut self, rounding: MeasuredSizeRounding) {
+        self.measured_size_rounding = rounding;
+    }
+
+    /// How layout rounds the sizes elements measure themselves at.
+    pub fn measured_size_rounding(&self) -> MeasuredSizeRounding {
+        self.measured_size_rounding
     }
 
     /// Writes data to the platform clipboard.

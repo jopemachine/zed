@@ -1,6 +1,6 @@
 use crate::{
-    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, Pixels, Point, Size,
-    Style, Window, size,
+    AbsoluteLength, App, Bounds, DefiniteLength, Edges, GridTemplate, Length, MeasuredSizeRounding,
+    Pixels, Point, Size, Style, Window, size,
     util::{
         ceil_to_device_pixel, round_half_toward_zero, round_stroke_to_device_pixel,
         round_to_device_pixel,
@@ -231,6 +231,7 @@ impl TaffyLayoutEngine {
             transform(available_space.width),
             transform(available_space.height),
         );
+        let measured_size_rounding = cx.measured_size_rounding();
 
         self.taffy
             .compute_layout_with_measure(
@@ -261,7 +262,14 @@ impl TaffyLayoutEngine {
 
                     let measured_size: Size<Pixels> =
                         (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                    match measured_size_rounding {
+                        MeasuredSizeRounding::DevicePixel => {
+                            snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                        }
+                        MeasuredSizeRounding::Fractional => measured_size
+                            .map(|length| length.0.max(0.0) * scale_factor)
+                            .into(),
+                    }
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -772,5 +780,115 @@ mod tests {
             taffy_border.left,
             taffy::style::LengthPercentage::length(2.0)
         );
+    }
+
+    /// A leaf as wide as `width` says when measured, like a text.
+    struct MeasuredLeaf {
+        width: Pixels,
+    }
+
+    impl crate::IntoElement for MeasuredLeaf {
+        type Element = Self;
+
+        fn into_element(self) -> Self::Element {
+            self
+        }
+    }
+
+    impl crate::Element for MeasuredLeaf {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<crate::ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            window: &mut Window,
+            _: &mut App,
+        ) -> (LayoutId, ()) {
+            let width = self.width;
+            let layout_id = window.request_measured_layout(Style::default(), move |_, _, _, _| {
+                size(width, crate::px(10.))
+            });
+            (layout_id, ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<Pixels>,
+            _: &mut (),
+            _: &mut (),
+            _: &mut Window,
+            _: &mut App,
+        ) {
+        }
+    }
+
+    #[derive(Debug)]
+    struct MeasuredRowCase {
+        rounding: MeasuredSizeRounding,
+        next_left: f32,
+    }
+
+    // The test window draws two device pixels to a point.
+    #[crate::test]
+    fn test_measured_size_rounding_places_what_follows_a_measured_leaf(
+        cx: &mut crate::TestAppContext,
+    ) {
+        use crate::{ParentElement as _, Styled as _, canvas, div, point, px};
+        use std::{cell::Cell, rc::Rc};
+
+        for case in [
+            MeasuredRowCase {
+                rounding: MeasuredSizeRounding::DevicePixel,
+                next_left: 10.5,
+            },
+            MeasuredRowCase {
+                rounding: MeasuredSizeRounding::Fractional,
+                next_left: 10.,
+            },
+        ] {
+            cx.update(|cx| cx.set_measured_size_rounding(case.rounding));
+            let cx = cx.add_empty_window();
+            let next_bounds = Rc::new(Cell::new(None));
+            let kept_bounds = next_bounds.clone();
+            cx.draw(
+                point(px(0.), px(0.)),
+                size(px(100.), px(20.)),
+                move |_, _| {
+                    div().flex().child(MeasuredLeaf { width: px(10.2) }).child(
+                        canvas(
+                            move |bounds, _, _| kept_bounds.set(Some(bounds)),
+                            |_, _, _, _| {},
+                        )
+                        .w(px(5.))
+                        .h(px(10.)),
+                    )
+                },
+            );
+            let next_bounds: Bounds<Pixels> = next_bounds.get().unwrap();
+            assert_eq!(next_bounds.left(), px(case.next_left), "{case:?}");
+        }
     }
 }

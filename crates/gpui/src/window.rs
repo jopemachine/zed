@@ -4,6 +4,7 @@ use crate::DebugFrameOverlayMode;
 use crate::Inspector;
 #[cfg(feature = "profiler")]
 use crate::profiler;
+use crate::scene::ElementScale;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
@@ -972,6 +973,20 @@ pub(crate) struct TooltipBounds {
     bounds: Bounds<Pixels>,
 }
 
+/// A tooltip a window drew, by the view that draws it and where.
+#[derive(Clone)]
+pub(crate) struct DrawnTooltip {
+    view: AnyView,
+    bounds: Bounds<Pixels>,
+}
+
+/// A hidden tooltip a window keeps drawing through its exit (see [`App::set_tooltip_exit_duration`]).
+#[derive(Clone)]
+pub(crate) struct ExitingTooltip {
+    drawn: DrawnTooltip,
+    since: Instant,
+}
+
 #[derive(Clone)]
 pub(crate) struct TooltipRequest {
     id: TooltipId,
@@ -1259,6 +1274,10 @@ pub struct Window {
     next_hitbox_id: HitboxId,
     pub(crate) next_tooltip_id: TooltipId,
     pub(crate) tooltip_bounds: Option<TooltipBounds>,
+    last_drawn_tooltip: Option<DrawnTooltip>,
+    exiting_tooltip: Option<ExitingTooltip>,
+    tooltip_exiting_since: Option<Instant>,
+    hit_testing_left_out_depth: usize,
     pub(crate) next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>>,
     pub(crate) dirty_views: FxHashSet<EntityId>,
     focus_listeners: SubscriberSet<(), AnyWindowFocusListener>,
@@ -2166,6 +2185,10 @@ impl Window {
             next_hitbox_id: HitboxId(0),
             next_tooltip_id: TooltipId::default(),
             tooltip_bounds: None,
+            last_drawn_tooltip: None,
+            exiting_tooltip: None,
+            tooltip_exiting_since: None,
+            hit_testing_left_out_depth: 0,
             dirty_views: FxHashSet::default(),
             focus_listeners: SubscriberSet::new(),
             focus_lost_listeners: SubscriberSet::new(),
@@ -3960,9 +3983,40 @@ impl Window {
                 id: tooltip_request.id,
                 bounds: tooltip_bounds,
             });
+            self.last_drawn_tooltip = Some(DrawnTooltip {
+                view: tooltip_request.tooltip.view,
+                bounds: tooltip_bounds,
+            });
+            self.exiting_tooltip = None;
             return Some(element);
         }
-        None
+        self.prepaint_exiting_tooltip(cx)
+    }
+
+    /// Keeps drawing the tooltip drawn last, after it was hidden, until its exit is over. Its
+    /// hitboxes are left out of hit testing.
+    fn prepaint_exiting_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
+        let exit_duration = cx.tooltip_exit_duration;
+        let now = cx.background_executor().now();
+        if let Some(drawn) = self.last_drawn_tooltip.take()
+            && !exit_duration.is_zero()
+        {
+            self.exiting_tooltip = Some(ExitingTooltip { drawn, since: now });
+        }
+        let exiting = self.exiting_tooltip.clone()?;
+        if now.saturating_duration_since(exiting.since) >= exit_duration {
+            self.exiting_tooltip = None;
+            return None;
+        }
+        self.on_next_frame(|window, _| window.refresh());
+        let mut element = exiting.drawn.view.into_any_element();
+        self.tooltip_exiting_since = Some(exiting.since);
+        element.layout_as_root(AvailableSpace::min_size(), self, cx);
+        self.tooltip_exiting_since = None;
+        self.with_absolute_element_offset(exiting.drawn.bounds.origin, |window| {
+            window.without_hit_testing(|window| element.prepaint(window, cx))
+        });
+        Some(element)
     }
 
     fn prepaint_deferred_draws(&mut self, cx: &mut App) {
@@ -4306,6 +4360,71 @@ impl Window {
         let result = f(self);
         self.element_offset_stack.pop();
         result
+    }
+
+    /// Paints the primitives `f` paints scaled by `factor` about `origin`, as a CSS `scale`
+    /// transform with a `transform-origin` scales an element and all it paints: its quads,
+    /// borders, shadows, text, images and paths shrink or grow toward `origin`. A clip set inside
+    /// `f` scales with what it clips, and the clip outside applies to what the scale draws.
+    /// Layout, hit testing and the bounds elements are given keep their unscaled values. `factor`
+    /// must be above zero.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn with_element_scale<R>(
+        &mut self,
+        origin: Point<Pixels>,
+        factor: f32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        debug_assert!(factor > 0., "an element cannot be scaled by {factor}");
+        if factor == 1. {
+            return f(self);
+        }
+        let outer_clip = self.content_mask().bounds;
+        let outer_clip_before_the_scale = Bounds {
+            origin: point(
+                origin.x + (outer_clip.origin.x - origin.x) / factor,
+                origin.y + (outer_clip.origin.y - origin.y) / factor,
+            ),
+            size: outer_clip.size.map(|length| length / factor),
+        };
+        let outer_masks = mem::replace(
+            &mut self.content_mask_stack,
+            vec![ContentMask {
+                bounds: outer_clip_before_the_scale,
+            }],
+        );
+        let scale = ElementScale {
+            origin: origin.scale(self.scale_factor()),
+            factor,
+            outer_clip: self.cover_bounds(outer_clip),
+        };
+        self.next_frame.scene.push_element_scale(scale);
+        let result = f(self);
+        self.next_frame.scene.pop_element_scale();
+        self.content_mask_stack = outer_masks;
+        result
+    }
+
+    /// Prepaints `f` with the hitboxes it inserts left out of hit testing, as CSS
+    /// `pointer-events: none` leaves an element to whatever is under it: those hitboxes are never
+    /// hovered, take no scroll wheel and block nothing behind them.
+    ///
+    /// This method should only be called as part of the prepaint phase of element drawing.
+    pub fn without_hit_testing<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_prepaint();
+        self.hit_testing_left_out_depth += 1;
+        let result = f(self);
+        self.hit_testing_left_out_depth -= 1;
+        result
+    }
+
+    /// While a window draws a hidden tooltip through its exit (see
+    /// [`App::set_tooltip_exit_duration`]), when the tooltip was hidden; `None` while it draws
+    /// anything else. A tooltip's view reads it as it renders to draw its exit.
+    pub fn tooltip_exiting_since(&self) -> Option<Instant> {
+        self.tooltip_exiting_since
     }
 
     pub(crate) fn with_element_opacity<R>(
@@ -5416,7 +5535,9 @@ impl Window {
             content_mask,
             behavior,
         };
-        self.next_frame.hitboxes.push(hitbox.clone());
+        if self.hit_testing_left_out_depth == 0 {
+            self.next_frame.hitboxes.push(hitbox.clone());
+        }
         hitbox
     }
 
@@ -8801,6 +8922,180 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(painted, case.expected_painted, "{}", case.name);
         }
+    }
+
+    #[test]
+    fn test_element_scale_paints_toward_its_origin() {
+        struct ElementScaleCase {
+            name: &'static str,
+            outer_clip_width: Pixels,
+            origin: Point<Pixels>,
+            expected: PaintedScaledQuad,
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct PaintedScaledQuad {
+            visible: Bounds<ScaledPixels>,
+            corner_radius: ScaledPixels,
+            border_width: ScaledPixels,
+        }
+
+        struct QuadScaledByHalf {
+            outer_clip_width: Rc<Cell<Pixels>>,
+            origin: Rc<Cell<Point<Pixels>>>,
+        }
+
+        impl Render for QuadScaledByHalf {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let origin = self.origin.get();
+                div().size_full().child(
+                    div()
+                        .w(self.outer_clip_width.get())
+                        .h(px(100.))
+                        .overflow_hidden()
+                        .child(
+                            canvas(
+                                |_, _, _| {},
+                                move |bounds, _, window, _| {
+                                    window.with_element_scale(origin, 0.5, |window| {
+                                        window.paint_quad(
+                                            crate::fill(bounds, hsla(0., 1., 0.5, 1.))
+                                                .corner_radii(px(8.))
+                                                .border_widths(px(2.))
+                                                .border_color(hsla(0.5, 1., 0.5, 1.)),
+                                        )
+                                    })
+                                },
+                            )
+                            .w(px(100.))
+                            .h(px(40.)),
+                        ),
+                )
+            }
+        }
+
+        let scaled_bounds = |left: f32, top: f32, width: f32, height: f32| {
+            Bounds::new(
+                point(ScaledPixels(left), ScaledPixels(top)),
+                size(ScaledPixels(width), ScaledPixels(height)),
+            )
+        };
+        let mut cx = TestAppContext::single();
+        let outer_clip_width = Rc::new(Cell::new(px(200.)));
+        let origin = Rc::new(Cell::new(point(px(0.), px(0.))));
+        let window = cx.add_window({
+            let outer_clip_width = outer_clip_width.clone();
+            let origin = origin.clone();
+            move |_, _| QuadScaledByHalf {
+                outer_clip_width,
+                origin,
+            }
+        });
+        let handle: AnyWindowHandle = window.into();
+        cx.simulate_window_scale_factor_change(handle, 1.);
+
+        for case in [
+            ElementScaleCase {
+                name: "about the middle of its top edge",
+                outer_clip_width: px(200.),
+                origin: point(px(50.), px(0.)),
+                expected: PaintedScaledQuad {
+                    visible: scaled_bounds(25., 0., 50., 20.),
+                    corner_radius: ScaledPixels(4.),
+                    border_width: ScaledPixels(1.),
+                },
+            },
+            // The clip outside applies to what the scale draws, as an ancestor's
+            // `overflow: hidden` clips a CSS transform: half of the quad fits in a clip that cut
+            // the whole quad.
+            ElementScaleCase {
+                name: "under a clip narrower than the quad but wider than half of it",
+                outer_clip_width: px(60.),
+                origin: point(px(0.), px(0.)),
+                expected: PaintedScaledQuad {
+                    visible: scaled_bounds(0., 0., 50., 20.),
+                    corner_radius: ScaledPixels(4.),
+                    border_width: ScaledPixels(1.),
+                },
+            },
+            ElementScaleCase {
+                name: "under a clip narrower than half of the quad",
+                outer_clip_width: px(30.),
+                origin: point(px(0.), px(0.)),
+                expected: PaintedScaledQuad {
+                    visible: scaled_bounds(0., 0., 30., 20.),
+                    corner_radius: ScaledPixels(4.),
+                    border_width: ScaledPixels(1.),
+                },
+            },
+        ] {
+            outer_clip_width.set(case.outer_clip_width);
+            origin.set(case.origin);
+            let painted = cx
+                .update_window(handle, |_, window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx);
+                    window.painted_quads()
+                })
+                .unwrap()
+                .iter()
+                .map(|quad| PaintedScaledQuad {
+                    visible: quad.bounds.intersect(&quad.content_mask.bounds),
+                    corner_radius: quad.corner_radii.top_left,
+                    border_width: quad.border_widths.top,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(painted, vec![case.expected], "{}", case.name);
+        }
+    }
+
+    #[test]
+    fn test_hitboxes_left_out_of_hit_testing_are_not_hovered_and_block_nothing() {
+        type InsertedHitboxes = Rc<RefCell<Option<(crate::Hitbox, crate::Hitbox)>>>;
+
+        struct HitboxUnderOneLeftOut {
+            inserted: InsertedHitboxes,
+        }
+
+        impl Render for HitboxUnderOneLeftOut {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inserted = self.inserted.clone();
+                canvas(
+                    move |bounds, window, _| {
+                        let behind = window.insert_hitbox(bounds, crate::HitboxBehavior::Normal);
+                        let in_front = window.without_hit_testing(|window| {
+                            window.insert_hitbox(bounds, crate::HitboxBehavior::BlockMouse)
+                        });
+                        inserted.replace(Some((behind, in_front)));
+                    },
+                    |_, _, _, _| {},
+                )
+                .w(px(100.))
+                .h(px(100.))
+            }
+        }
+
+        let mut cx = TestAppContext::single();
+        let inserted: InsertedHitboxes = Rc::default();
+        let window = cx.add_window({
+            let inserted = inserted.clone();
+            move |_, _| HitboxUnderOneLeftOut { inserted }
+        });
+        let handle: AnyWindowHandle = window.into();
+
+        let (behind_is_hovered, in_front_is_hovered) = cx
+            .update_window(handle, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let (behind, in_front) = inserted.borrow().clone().unwrap();
+                let pointer = point(px(50.), px(50.));
+                (
+                    behind.is_hovered_at(pointer, window),
+                    in_front.is_hovered_at(pointer, window),
+                )
+            })
+            .unwrap();
+
+        assert_eq!((behind_is_hovered, in_front_is_hovered), (true, false));
     }
 
     #[test]

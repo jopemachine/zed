@@ -912,6 +912,7 @@ pub struct App {
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     pub(crate) layout_rounding: Rc<Cell<LayoutRounding>>,
+    pub(crate) tooltip_exit_duration: Duration,
 
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
@@ -964,6 +965,7 @@ impl App {
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
                 layout_rounding: Rc::new(Cell::new(LayoutRounding::default())),
+                tooltip_exit_duration: Duration::ZERO,
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
                 pending_updates: 0,
@@ -1773,6 +1775,13 @@ impl App {
     /// How layout rounds lengths to device pixels.
     pub fn layout_rounding(&self) -> LayoutRounding {
         self.layout_rounding.get()
+    }
+
+    /// Has every window keep drawing a tooltip for `duration` after hiding it, at the place it
+    /// was drawn and without taking the mouse, so the tooltip's view can draw its exit (see
+    /// [`Window::tooltip_exiting_since`]). Zero, the default, takes a hidden tooltip away at once.
+    pub fn set_tooltip_exit_duration(&mut self, duration: Duration) {
+        self.tooltip_exit_duration = duration;
     }
 
     /// Writes data to the platform clipboard.

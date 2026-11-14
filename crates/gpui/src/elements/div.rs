@@ -5173,6 +5173,154 @@ mod tests {
         assert!(active_tooltip.borrow().is_none());
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum TooltipPaint {
+        Shown,
+        Exiting,
+    }
+
+    struct ExitRecordingTooltip {
+        paints: Rc<RefCell<Vec<TooltipPaint>>>,
+    }
+
+    impl Render for ExitRecordingTooltip {
+        fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paint = match window.tooltip_exiting_since() {
+                Some(_) => TooltipPaint::Exiting,
+                None => TooltipPaint::Shown,
+            };
+            let paints = self.paints.clone();
+            crate::canvas(
+                |_, _, _| {},
+                move |_, _, _, _| paints.borrow_mut().push(paint),
+            )
+            .w(px(20.))
+            .h(px(20.))
+        }
+    }
+
+    struct ExitRecordingTooltipOwner {
+        paints: Rc<RefCell<Vec<TooltipPaint>>>,
+    }
+
+    impl Render for ExitRecordingTooltipOwner {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let paints = self.paints.clone();
+            div()
+                .size_full()
+                .child(
+                    div()
+                        .id("target")
+                        .w(px(50.))
+                        .h(px(50.))
+                        .tooltip(move |_, cx| {
+                            let paints = paints.clone();
+                            cx.new(|_| ExitRecordingTooltip { paints }).into()
+                        }),
+                )
+        }
+    }
+
+    #[test]
+    fn hidden_tooltip_is_drawn_through_its_exit_duration() {
+        struct TooltipExitCase {
+            name: &'static str,
+            exit_duration: Duration,
+            expected: TooltipPaintsAfterHiding,
+        }
+
+        #[derive(Debug, PartialEq)]
+        struct TooltipPaintsAfterHiding {
+            during_the_exit: Vec<TooltipPaint>,
+            after_the_exit: Vec<TooltipPaint>,
+        }
+
+        let move_mouse_to = |test_app: &mut TestAppContext,
+                             window: crate::AnyWindowHandle,
+                             position: Point<Pixels>| {
+            test_app
+                .update_window(window, |_, window, cx| {
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position,
+                            modifiers: Default::default(),
+                            pressed_button: None,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+        };
+
+        for case in [
+            TooltipExitCase {
+                name: "no exit duration",
+                exit_duration: Duration::ZERO,
+                expected: TooltipPaintsAfterHiding {
+                    during_the_exit: Vec::new(),
+                    after_the_exit: Vec::new(),
+                },
+            },
+            TooltipExitCase {
+                name: "an exit duration",
+                exit_duration: Duration::from_millis(100),
+                expected: TooltipPaintsAfterHiding {
+                    during_the_exit: vec![TooltipPaint::Exiting],
+                    after_the_exit: Vec::new(),
+                },
+            },
+        ] {
+            let mut test_app = TestAppContext::single();
+            test_app.update(|cx| cx.set_tooltip_exit_duration(case.exit_duration));
+            let paints: Rc<RefCell<Vec<TooltipPaint>>> = Rc::default();
+            let window = test_app.add_window({
+                let paints = paints.clone();
+                move |_, _| ExitRecordingTooltipOwner { paints }
+            });
+            let window: crate::AnyWindowHandle = window.into();
+            move_mouse_to(&mut test_app, window, point(px(10.), px(10.)));
+            test_app
+                .dispatcher
+                .advance_clock(DEFAULT_TOOLTIP_SHOW_DELAY);
+            test_app.run_until_parked();
+            test_app
+                .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            assert_eq!(
+                paints.take().last(),
+                Some(&TooltipPaint::Shown),
+                "{}",
+                case.name
+            );
+
+            move_mouse_to(&mut test_app, window, point(px(75.), px(75.)));
+            let mut during_the_exit = paints.take();
+            during_the_exit.dedup();
+            test_app
+                .dispatcher
+                .advance_clock(case.exit_duration + Duration::from_millis(1));
+            test_app
+                .update_window(window, |_, window, cx| {
+                    window.refresh();
+                    window.draw(cx).clear(cx)
+                })
+                .unwrap();
+            let after_the_exit = paints.take();
+
+            assert_eq!(
+                TooltipPaintsAfterHiding {
+                    during_the_exit,
+                    after_the_exit,
+                },
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+    }
+
     struct MouseDownOutOwner {
         mouse_down_out_count: Rc<RefCell<usize>>,
     }

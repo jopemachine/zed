@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    element_scales: Vec<ElementScale>,
 }
 
 #[expect(missing_docs)]
@@ -58,6 +59,7 @@ impl Scene {
         self.paint_operations.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
+        self.element_scales.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -86,6 +88,23 @@ impl Scene {
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let mut primitive = primitive.into();
+        for scale in self.element_scales.iter().rev() {
+            scale.apply_to(&mut primitive);
+        }
+        self.insert_placed_primitive(primitive);
+    }
+
+    /// Scales the primitives inserted from now on until [`Self::pop_element_scale`], after any
+    /// scale pushed later.
+    pub(crate) fn push_element_scale(&mut self, scale: ElementScale) {
+        self.element_scales.push(scale);
+    }
+
+    pub(crate) fn pop_element_scale(&mut self) {
+        self.element_scales.pop();
+    }
+
+    fn insert_placed_primitive(&mut self, mut primitive: Primitive) {
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -141,7 +160,9 @@ impl Scene {
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive(primitive) => {
+                    self.insert_placed_primitive(primitive.clone())
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
@@ -600,6 +621,117 @@ pub enum BorderStyle {
     Solid = 0,
     /// A dashed border.
     Dashed = 1,
+}
+
+/// A scale about a point that every primitive an element paints takes, as a CSS `scale` transform
+/// with a `transform-origin` scales an element and all it paints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ElementScale {
+    /// The point that stays where it is.
+    pub(crate) origin: Point<ScaledPixels>,
+    pub(crate) factor: f32,
+    /// The clip the element is under from outside it, which its scaled primitives stay inside.
+    pub(crate) outer_clip: Bounds<ScaledPixels>,
+}
+
+impl ElementScale {
+    fn length(&self, length: ScaledPixels) -> ScaledPixels {
+        length * self.factor
+    }
+
+    fn point(&self, at: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        point(
+            self.origin.x + (at.x - self.origin.x) * self.factor,
+            self.origin.y + (at.y - self.origin.y) * self.factor,
+        )
+    }
+
+    fn bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: self.point(bounds.origin),
+            size: bounds.size.map(|length| self.length(length)),
+        }
+    }
+
+    fn content_mask(&self, mask: &ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: self.bounds(mask.bounds).intersect(&self.outer_clip),
+        }
+    }
+
+    fn corners(&self, corners: &Corners<ScaledPixels>) -> Corners<ScaledPixels> {
+        corners.map(|radius| self.length(*radius))
+    }
+
+    /// The transformation that draws a sprite whose bounds were scaled where its old
+    /// transformation would have drawn it before the scale: the scale is taken about the point
+    /// the old transformation moves `origin` to.
+    fn transformation(&self, transformation: TransformationMatrix) -> TransformationMatrix {
+        if transformation == TransformationMatrix::unit() {
+            return transformation;
+        }
+        let [[a, b], [c, d]] = transformation.rotation_scale;
+        let (x, y) = (self.origin.x.0, self.origin.y.0);
+        let unscaled_part = 1. - self.factor;
+        TransformationMatrix {
+            rotation_scale: transformation.rotation_scale,
+            translation: [
+                transformation.translation[0] * self.factor + unscaled_part * (x - (a * x + b * y)),
+                transformation.translation[1] * self.factor + unscaled_part * (y - (c * x + d * y)),
+            ],
+        }
+    }
+
+    fn apply_to(&self, primitive: &mut Primitive) {
+        match primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = self.bounds(shadow.bounds);
+                shadow.content_mask = self.content_mask(&shadow.content_mask);
+                shadow.blur_radius = self.length(shadow.blur_radius);
+                shadow.corner_radii = self.corners(&shadow.corner_radii);
+                shadow.element_bounds = self.bounds(shadow.element_bounds);
+                shadow.element_corner_radii = self.corners(&shadow.element_corner_radii);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = self.bounds(quad.bounds);
+                quad.content_mask = self.content_mask(&quad.content_mask);
+                quad.corner_radii = self.corners(&quad.corner_radii);
+                quad.border_widths = quad.border_widths.map(|width| self.length(*width));
+            }
+            Primitive::Path(path) => {
+                path.bounds = self.bounds(path.bounds);
+                path.content_mask = self.content_mask(&path.content_mask);
+                for vertex in &mut path.vertices {
+                    vertex.xy_position = self.point(vertex.xy_position);
+                    vertex.content_mask = self.content_mask(&vertex.content_mask);
+                }
+            }
+            Primitive::Underline(underline) => {
+                underline.bounds = self.bounds(underline.bounds);
+                underline.content_mask = self.content_mask(&underline.content_mask);
+                underline.thickness = self.length(underline.thickness);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.content_mask(&sprite.content_mask);
+                sprite.transformation = self.transformation(sprite.transformation);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.content_mask(&sprite.content_mask);
+                sprite.transformation = self.transformation(sprite.transformation);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.content_mask(&sprite.content_mask);
+                sprite.corner_radii = self.corners(&sprite.corner_radii);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = self.bounds(surface.bounds);
+                surface.content_mask = self.content_mask(&surface.content_mask);
+            }
+        }
+    }
 }
 
 /// A data type representing a 2 dimensional transformation that can be applied to an element.

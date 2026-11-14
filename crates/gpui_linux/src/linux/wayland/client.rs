@@ -196,6 +196,9 @@ fn set_ime_cursor_rectangle_after_done(
 /// failed-present frames, so matching the output's actual refresh rate wouldn't be observable.
 const FRAME_RETRY_INTERVAL: Duration = Duration::from_micros(16_667);
 
+/// On a seat with a touch screen, how long the mouse stays still before its cursor is hidden again.
+const STILL_MOUSE_CURSOR_HIDE_DELAY: Duration = Duration::from_secs(3);
+
 pub(crate) fn take_startup_activation_token_from_environment() -> Option<String> {
     let token = std::env::var(XDG_ACTIVATION_TOKEN_ENV_VAR)
         .ok()
@@ -412,6 +415,8 @@ pub(crate) struct WaylandClientState {
     loop_handle: LoopHandle<'static, ()>,
     cursor_style: Option<CursorStyle>,
     cursor_hidden_window: Option<WaylandWindowStatePtr>,
+    last_mouse_motion_at: Instant,
+    still_mouse_cursor_hide_is_scheduled: bool,
     clipboard: Clipboard,
     data_offers: Vec<DataOffer<WlDataOffer>>,
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
@@ -878,6 +883,47 @@ impl WaylandClientState {
             scale,
         );
     }
+
+    /// On a seat with a touch screen the mouse is a secondary input, so its cursor is shown
+    /// only while the mouse moves, as touch-first platforms do.
+    fn seat_has_touch_screen(&self) -> bool {
+        self.wl_touch.is_some()
+    }
+
+    /// Hides the cursor once the mouse has stayed still for [`STILL_MOUSE_CURSOR_HIDE_DELAY`].
+    /// A held button keeps the cursor shown.
+    fn schedule_still_mouse_cursor_hide(&mut self, client: &WaylandClientStatePtr) {
+        if self.still_mouse_cursor_hide_is_scheduled {
+            return;
+        }
+        let client = client.clone();
+        let scheduled = self.loop_handle.insert_source(
+            Timer::from_deadline(self.last_mouse_motion_at + STILL_MOUSE_CURSOR_HIDE_DELAY),
+            move |_, _, _| {
+                let Some(client) = client.0.upgrade() else {
+                    return TimeoutAction::Drop;
+                };
+                let mut state = client.borrow_mut();
+                let now = Instant::now();
+                if state.button_pressed.is_some() {
+                    return TimeoutAction::ToInstant(now + STILL_MOUSE_CURSOR_HIDE_DELAY);
+                }
+                let hide_at = state.last_mouse_motion_at + STILL_MOUSE_CURSOR_HIDE_DELAY;
+                if now < hide_at {
+                    return TimeoutAction::ToInstant(hide_at);
+                }
+                state.still_mouse_cursor_hide_is_scheduled = false;
+                state.hide_cursor_until_mouse_moves();
+                TimeoutAction::Drop
+            },
+        );
+        match scheduled {
+            Ok(_) => self.still_mouse_cursor_hide_is_scheduled = true,
+            Err(error) => {
+                log::error!("Failed to schedule hiding the cursor of a still mouse: {error}")
+            }
+        }
+    }
 }
 
 /// A connection to the Wayland compositor.
@@ -1136,6 +1182,8 @@ impl WaylandConnection {
             enter_token: None,
             cursor_style: None,
             cursor_hidden_window: None,
+            last_mouse_motion_at: Instant::now(),
+            still_mouse_cursor_hide_is_scheduled: false,
             clipboard: Clipboard::new(conn.clone(), handle.clone()),
             data_offers: Vec::new(),
             primary_data_offer: None,
@@ -2528,18 +2576,26 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     if state.enter_token.is_some() {
                         state.enter_token = None;
                     }
-                    state.restore_cursor_after_hide();
-                    if let Some(style) = state.cursor_style {
-                        if let Some(cursor_shape_device) = &state.cursor_shape_device {
-                            cursor_shape_device.set_shape(serial, to_shape(style));
-                        } else {
-                            let scale = window.primary_output_scale();
-                            state.cursor.set_icon(
-                                wl_pointer,
-                                serial,
-                                cursor_style_to_icon_names(style),
-                                scale,
-                            );
+                    if state.seat_has_touch_screen() {
+                        // A compositor also enters a window under a pointer that has not moved,
+                        // as when the window maps or takes focus, so on a touch screen the cursor
+                        // waits for the mouse to move.
+                        state.cursor_hidden_window = None;
+                        state.hide_cursor_until_mouse_moves();
+                    } else {
+                        state.restore_cursor_after_hide();
+                        if let Some(style) = state.cursor_style {
+                            if let Some(cursor_shape_device) = &state.cursor_shape_device {
+                                cursor_shape_device.set_shape(serial, to_shape(style));
+                            } else {
+                                let scale = window.primary_output_scale();
+                                state.cursor.set_icon(
+                                    wl_pointer,
+                                    serial,
+                                    cursor_style_to_icon_names(style),
+                                    scale,
+                                );
+                            }
                         }
                     }
                     let modifiers = state.modifiers;
@@ -2581,6 +2637,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
                 state.mouse_location = Some(point(px(surface_x as f32), px(surface_y as f32)));
                 state.restore_cursor_after_hide();
+                if state.seat_has_touch_screen() {
+                    state.last_mouse_motion_at = Instant::now();
+                    state.schedule_still_mouse_cursor_hide(this);
+                }
 
                 if let Some(window) = state.mouse_focused_window.clone() {
                     if window.is_blocked() {

@@ -1,10 +1,9 @@
 use crate::{
     ActiveTooltip, AnyView, App, Bounds, DispatchPhase, Element, ElementId, GlobalElementId,
     HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId,
-    MeasuredSizeRounding, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
-    SharedString, Size, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace,
-    Window, WrappedLine, WrappedLineLayout, px, register_tooltip_mouse_handlers,
-    set_tooltip_on_window,
+    LayoutRounding, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString,
+    Size, TextOverflow, TextRun, TextStyle, TooltipId, TruncateFrom, WhiteSpace, Window,
+    WrappedLine, WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
@@ -641,11 +640,14 @@ impl TextLayout {
     ) -> LayoutId {
         let text_style = window.text_style();
         let font_size = text_style.font_size.to_pixels(window.rem_size());
-        let line_height = window.pixel_snap(
-            text_style
-                .line_height
-                .to_pixels(font_size.into(), window.rem_size()),
-        );
+        let layout_rounding = window.layout_rounding();
+        let line_height = text_style
+            .line_height
+            .to_pixels(font_size.into(), window.rem_size());
+        let line_height = match layout_rounding {
+            LayoutRounding::DevicePixel => window.pixel_snap(line_height),
+            LayoutRounding::Fractional => line_height,
+        };
 
         let runs = if let Some(runs) = runs {
             runs
@@ -774,9 +776,9 @@ impl TextLayout {
                     size.height += line_size.height;
                     size.width = size.width.max(line_size.width);
                 }
-                size.width = match cx.measured_size_rounding() {
-                    MeasuredSizeRounding::DevicePixel => size.width.ceil(),
-                    MeasuredSizeRounding::FractionalWidth => Self::layout_unit_above(size.width),
+                size.width = match layout_rounding {
+                    LayoutRounding::DevicePixel => size.width.ceil(),
+                    LayoutRounding::Fractional => Self::layout_unit_above(size.width),
                 };
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {
@@ -1391,6 +1393,57 @@ mod tests {
                 px(case.layout_width),
                 "{case:?}"
             );
+        }
+    }
+
+    #[derive(Debug)]
+    struct StackedLinesCase {
+        rounding: LayoutRounding,
+        under_two_lines: f32,
+    }
+
+    // The test window draws two device pixels to a point.
+    #[crate::test]
+    fn test_layout_rounding_stacks_text_lines(cx: &mut crate::TestAppContext) {
+        use crate::{ParentElement as _, Styled as _, canvas, div, point, size};
+        use std::{cell::Cell, rc::Rc};
+
+        for case in [
+            StackedLinesCase {
+                rounding: LayoutRounding::DevicePixel,
+                under_two_lines: 20.,
+            },
+            StackedLinesCase {
+                rounding: LayoutRounding::Fractional,
+                under_two_lines: 20.5,
+            },
+        ] {
+            cx.update(|cx| cx.set_layout_rounding(case.rounding));
+            let cx = cx.add_empty_window();
+            let below_bounds = Rc::new(Cell::new(None));
+            let kept_below = below_bounds.clone();
+            cx.draw(
+                point(px(0.), px(0.)),
+                size(px(100.), px(60.)),
+                move |_, _| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .line_height(px(10.2))
+                        .child(div().child("a"))
+                        .child(div().child("b"))
+                        .child(
+                            canvas(
+                                move |bounds, _, _| kept_below.set(Some(bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .w(px(5.))
+                            .h(px(5.)),
+                        )
+                },
+            );
+            let below: Bounds<Pixels> = below_bounds.get().unwrap();
+            assert_eq!(below.top(), px(case.under_two_lines), "{case:?}");
         }
     }
 }

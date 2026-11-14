@@ -810,18 +810,20 @@ enum PlatformOwnedDragState {
     RestoredInSourceWindow,
 }
 
-/// How layout rounds the size an element measured itself at, such as the size of a text.
+/// How layout rounds lengths to device pixels.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum MeasuredSizeRounding {
-    /// Up to whole device pixels, after a text's width is rounded up to a whole point.
+pub enum LayoutRounding {
+    /// Before layout, every authored length, a text's line height and the size an element
+    /// measures itself at are rounded to whole device pixels, a text's width after it is rounded
+    /// up to a whole point.
     #[default]
     DevicePixel,
-    /// The width as measured, as a browser lays out boxes in fractions of a pixel. A text's width
-    /// is rounded up to the next 1/64 of a point, as Chromium's `LayoutUnit` holds it, so the text
-    /// laid out at that width keeps its lines. The height is still rounded up to whole device
-    /// pixels, as a text's line height is, so rows stacked by their text keep their places. Each
-    /// element's edges are still snapped to device pixels after layout.
-    FractionalWidth,
+    /// Lengths, line heights and measured sizes stay fractional through layout, as a browser lays
+    /// out boxes in fractions of a pixel. A text's width is rounded up to the next 1/64 of a point,
+    /// as Chromium's `LayoutUnit` holds it, so the text laid out at that width keeps its lines.
+    /// Border widths are still snapped to device pixels before layout, and each element's edges
+    /// after it.
+    Fractional,
 }
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
@@ -909,7 +911,7 @@ pub struct App {
     #[cfg(any(test, feature = "test-support", debug_assertions))]
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
-    measured_size_rounding: MeasuredSizeRounding,
+    pub(crate) layout_rounding: Rc<Cell<LayoutRounding>>,
 
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) mode: GpuiMode,
@@ -961,7 +963,7 @@ impl App {
                 platform: platform.clone(),
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
-                measured_size_rounding: MeasuredSizeRounding::default(),
+                layout_rounding: Rc::new(Cell::new(LayoutRounding::default())),
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
                 pending_updates: 0,
@@ -1762,15 +1764,15 @@ impl App {
         self.text_rendering_mode.get()
     }
 
-    /// Chooses how layout rounds the sizes elements measure themselves at, such as the width
-    /// of a text, from the next layout on.
-    pub fn set_measured_size_rounding(&mut self, rounding: MeasuredSizeRounding) {
-        self.measured_size_rounding = rounding;
+    /// Chooses how layout rounds lengths to device pixels, in every window from its next layout
+    /// on.
+    pub fn set_layout_rounding(&mut self, rounding: LayoutRounding) {
+        self.layout_rounding.set(rounding);
     }
 
-    /// How layout rounds the sizes elements measure themselves at.
-    pub fn measured_size_rounding(&self) -> MeasuredSizeRounding {
-        self.measured_size_rounding
+    /// How layout rounds lengths to device pixels.
+    pub fn layout_rounding(&self) -> LayoutRounding {
+        self.layout_rounding.get()
     }
 
     /// Writes data to the platform clipboard.

@@ -2,8 +2,8 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
     FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, Hsla, JustifyContent, Length,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    OverflowWrap, SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
+    TextStyleRefinement, UnderlineStyle, WhiteSpace, WordBreak, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -81,6 +81,20 @@ pub trait Styled: Sized {
     /// [Docs](https://tailwindcss.com/docs/whitespace#nowrap)
     fn whitespace_nowrap(mut self) -> Self {
         self.text_style().white_space = Some(WhiteSpace::Nowrap);
+        self
+    }
+
+    /// Sets where the element's wrapped lines of text may break between two characters, like
+    /// CSS `word-break`.
+    fn word_break(mut self, word_break: WordBreak) -> Self {
+        self.text_style().word_break = Some(word_break);
+        self
+    }
+
+    /// Sets whether a word of the element's text that is wider than its line breaks inside, like
+    /// CSS `overflow-wrap`.
+    fn overflow_wrap(mut self, overflow_wrap: OverflowWrap) -> Self {
+        self.text_style().overflow_wrap = Some(overflow_wrap);
         self
     }
 

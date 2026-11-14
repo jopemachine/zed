@@ -1,12 +1,14 @@
 mod font_fallbacks;
 mod font_features;
 mod line;
+mod line_breaking;
 mod line_layout;
 mod line_wrapper;
 
 pub use font_fallbacks::*;
 pub use font_features::*;
 pub use line::*;
+pub use line_breaking::*;
 pub use line_layout::*;
 pub use line_wrapper::*;
 use schemars::JsonSchema;
@@ -792,6 +794,27 @@ impl WindowTextSystem {
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
     ) -> Result<SmallVec<[WrappedLine; 1]>> {
+        self.shape_text_with_line_breaking(
+            text,
+            font_size,
+            runs,
+            wrap_width,
+            line_clamp,
+            LineBreaking::default(),
+        )
+    }
+
+    /// Shape a multi line string of text as [`Self::shape_text`] does, breaking its wrapped lines
+    /// where `line_breaking` allows.
+    pub fn shape_text_with_line_breaking(
+        &self,
+        text: SharedString,
+        font_size: Pixels,
+        runs: &[TextRun],
+        wrap_width: Option<Pixels>,
+        line_clamp: Option<usize>,
+        line_breaking: LineBreaking,
+    ) -> Result<SmallVec<[WrappedLine; 1]>> {
         let mut runs = runs.iter().filter(|run| run.len > 0).cloned().peekable();
         let mut font_runs = self.font_runs_pool.lock().pop().unwrap_or_default();
 
@@ -858,6 +881,7 @@ impl WindowTextSystem {
                 &font_runs,
                 wrap_width,
                 max_wrap_lines.map(|max| max.saturating_sub(wrapped_lines)),
+                line_breaking,
             );
             wrapped_lines += layout.wrap_boundaries.len();
 

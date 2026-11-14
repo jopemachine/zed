@@ -1,4 +1,7 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    FontId, GlyphId, LineBreaking, OverflowWrap, Pixels, PlatformTextSystem, Point, SharedString,
+    Size, point, px,
+};
 use collections::FxHashMap;
 use parking_lot::{Mutex, RwLock, RwLockUpgradableReadGuard};
 use smallvec::SmallVec;
@@ -191,7 +194,9 @@ impl LineLayout {
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
+        line_breaking: LineBreaking,
     ) -> SmallVec<[WrapBoundary; 1]> {
+        let line_start_offsets = line_breaking.line_start_offsets(text);
         let mut boundaries = SmallVec::new();
         let mut first_non_whitespace_ix = None;
         let mut last_candidate_ix = None;
@@ -211,6 +216,7 @@ impl LineLayout {
                     let character = text[glyph.index..].chars().next().unwrap();
                     (
                         WrapBoundary { run_ix, glyph_ix },
+                        glyph.index,
                         character,
                         glyph.position.x,
                     )
@@ -218,48 +224,52 @@ impl LineLayout {
             })
             .peekable();
 
-        while let Some((boundary, ch, x)) = glyphs.next() {
+        while let Some((boundary, glyph_index, ch, x)) = glyphs.next() {
             if ch == '\n' {
                 continue;
             }
 
             // Here is very similar to `LineWrapper::wrap_line` to determine text wrapping,
             // but there are some differences, so we have to duplicate the code here.
-            if LineWrapper::is_word_char(ch) {
-                if prev_ch == ' ' && ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
-            } else {
-                if ch != ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = Some(boundary);
-                    last_candidate_x = x;
-                }
+            let may_start_line = match &line_start_offsets {
+                Some(offsets) => offsets.binary_search(&glyph_index).is_ok(),
+                None if LineWrapper::is_word_char(ch) => prev_ch == ' ' && ch != ' ',
+                None => ch != ' ',
+            };
+            if may_start_line && first_non_whitespace_ix.is_some() {
+                last_candidate_ix = Some(boundary);
+                last_candidate_x = x;
             }
 
             if ch != ' ' && first_non_whitespace_ix.is_none() {
                 first_non_whitespace_ix = Some(boundary);
             }
 
-            let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
+            let next_x = glyphs.peek().map_or(self.width, |(_, _, _, x)| *x);
             let width = next_x - last_boundary_x;
+            let hangs_past_line_end =
+                line_start_offsets.is_some() && LineBreaking::hangs_past_line_end(ch);
 
-            if width > wrap_width && boundary > last_boundary {
-                // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
-                    break;
-                }
+            if width > wrap_width && boundary > last_boundary && !hangs_past_line_end {
+                let next_boundary = match last_candidate_ix.take() {
+                    Some(candidate) => Some((candidate, last_candidate_x)),
+                    None => match line_breaking.overflow_wrap {
+                        OverflowWrap::Anywhere => Some((boundary, x)),
+                        OverflowWrap::Normal => None,
+                    },
+                };
+                if let Some((next_boundary, next_boundary_x)) = next_boundary {
+                    // When used line_clamp, we should limit the number of lines.
+                    if let Some(max_lines) = max_lines
+                        && boundaries.len() >= max_lines.saturating_sub(1)
+                    {
+                        break;
+                    }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
+                    last_boundary = next_boundary;
+                    last_boundary_x = next_boundary_x;
+                    boundaries.push(last_boundary);
                 }
-                boundaries.push(last_boundary);
             }
             prev_ch = ch;
         }
@@ -602,6 +612,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
+        line_breaking: LineBreaking,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -614,6 +625,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            line_breaking,
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -634,7 +646,12 @@ impl LineLayoutCache {
             let text = SharedString::from(text);
             let unwrapped_layout = self.layout_line::<&SharedString>(&text, font_size, runs, None);
             let wrap_boundaries = if let Some(wrap_width) = wrap_width {
-                unwrapped_layout.compute_wrap_boundaries(text.as_ref(), wrap_width, max_lines)
+                unwrapped_layout.compute_wrap_boundaries(
+                    text.as_ref(),
+                    wrap_width,
+                    max_lines,
+                    line_breaking,
+                )
             } else {
                 SmallVec::new()
             };
@@ -649,6 +666,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                line_breaking,
             });
 
             let mut current_frame = self.current_frame.write();
@@ -679,6 +697,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            line_breaking: LineBreaking::default(),
         } as &dyn AsCacheKeyRef;
 
         let current_frame = self.current_frame.upgradable_read();
@@ -707,6 +726,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                line_breaking: LineBreaking::default(),
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -936,6 +956,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    line_breaking: LineBreaking,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -945,6 +966,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    line_breaking: LineBreaking,
 }
 
 #[derive(Clone, Debug)]
@@ -1037,6 +1059,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            line_breaking: self.line_breaking,
         }
     }
 }
@@ -1068,7 +1091,7 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GlyphId;
+    use crate::{GlyphId, WordBreak};
 
     fn glyph_at(x: f32, index: usize) -> ShapedGlyph {
         ShapedGlyph {
@@ -1200,5 +1223,109 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// A layout of `text` in which every character is one glyph 10px wide.
+    fn monospaced_layout(text: &str) -> LineLayout {
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(column, (index, _))| glyph_at(column as f32 * 10., index))
+            .collect();
+        LineLayout {
+            width: px(text.chars().count() as f32 * 10.),
+            len: text.len(),
+            ..make_layout(glyphs)
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrappedLinesCase {
+        text: &'static str,
+        wrap_width: f32,
+        line_breaking: LineBreaking,
+        lines: &'static [&'static str],
+    }
+
+    #[test]
+    fn test_compute_wrap_boundaries_with_line_breaking() {
+        let breaking = |word_break, overflow_wrap| LineBreaking {
+            word_break,
+            overflow_wrap,
+        };
+        let cases = [
+            WrappedLinesCase {
+                text: "날짜 (Asia/Seoul)",
+                wrap_width: 130.,
+                line_breaking: LineBreaking::default(),
+                lines: &["날짜 (Asia", "/Seoul)"],
+            },
+            WrappedLinesCase {
+                text: "날짜 (Asia/Seoul)",
+                wrap_width: 130.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["날짜 ", "(Asia/Seoul)"],
+            },
+            WrappedLinesCase {
+                text: "가나 다라마바사",
+                wrap_width: 50.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["가나 ", "다라마바사"],
+            },
+            WrappedLinesCase {
+                text: "가나 다라마바사",
+                wrap_width: 50.,
+                line_breaking: breaking(WordBreak::Normal, OverflowWrap::Anywhere),
+                lines: &["가나 다라", "마바사"],
+            },
+            WrappedLinesCase {
+                text: "ab cdefg",
+                wrap_width: 50.,
+                line_breaking: breaking(WordBreak::BreakAll, OverflowWrap::Anywhere),
+                lines: &["ab cd", "efg"],
+            },
+            WrappedLinesCase {
+                text: "abcd efg",
+                wrap_width: 40.,
+                line_breaking: LineBreaking::default(),
+                lines: &["abcd", " efg"],
+            },
+            WrappedLinesCase {
+                text: "abcd efg",
+                wrap_width: 40.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["abcd ", "efg"],
+            },
+            WrappedLinesCase {
+                text: "abcdefgh ij",
+                wrap_width: 40.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["abcd", "efgh ", "ij"],
+            },
+            WrappedLinesCase {
+                text: "abcdefgh ij",
+                wrap_width: 40.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Normal),
+                lines: &["abcdefgh ", "ij"],
+            },
+        ];
+        for case in cases {
+            let layout = monospaced_layout(case.text);
+            let boundaries = layout.compute_wrap_boundaries(
+                case.text,
+                px(case.wrap_width),
+                None,
+                case.line_breaking,
+            );
+            let mut lines = Vec::new();
+            let mut line_start = 0;
+            for boundary in boundaries {
+                let line_end = layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                lines.push(&case.text[line_start..line_end]);
+                line_start = line_end;
+            }
+            lines.push(&case.text[line_start..]);
+            assert_eq!(lines, case.lines, "{case:?}");
+        }
     }
 }

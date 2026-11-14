@@ -712,6 +712,7 @@ impl TextLayout {
                             &truncation_affix,
                             &runs,
                             truncate_from,
+                            text_style.line_breaking(),
                         )
                     } else if let Some(unclipped) = window
                         .text_system()
@@ -744,12 +745,13 @@ impl TextLayout {
 
                 let Some(lines) = window
                     .text_system()
-                    .shape_text(
+                    .shape_text_with_line_breaking(
                         text,
                         font_size,
                         &runs,
                         wrap_width,            // Wrap if we know the width.
                         text_style.line_clamp, // Limit the number of lines if line_clamp is set.
+                        text_style.line_breaking(),
                     )
                     .log_err()
                 else {

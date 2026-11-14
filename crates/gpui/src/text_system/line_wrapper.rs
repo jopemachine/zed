@@ -1,4 +1,4 @@
-use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
+use crate::{FontId, LineBreaking, OverflowWrap, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
 
@@ -372,6 +372,7 @@ impl LineWrapper {
         truncation_affix: &str,
         runs: &'a [TextRun],
         truncate_from: TruncateFrom,
+        line_breaking: LineBreaking,
     ) -> (SharedString, Cow<'a, [TextRun]>) {
         if max_lines <= 1 || truncate_from == TruncateFrom::Start {
             return self.truncate_line(
@@ -400,6 +401,7 @@ impl LineWrapper {
         let mut prev_c = '\0';
         let mut indent: Option<u32> = None;
         let mut truncate_ix = 0usize;
+        let line_start_offsets = line_breaking.line_start_offsets(&text);
 
         for (ix, c) in text.char_indices() {
             if c == '\n' {
@@ -434,12 +436,12 @@ impl LineWrapper {
 
             let char_width = self.width_for_char(c);
 
-            if Self::is_word_char(c) {
-                if prev_c == ' ' && first_non_whitespace_ix.is_some() {
-                    last_candidate_ix = ix;
-                    last_candidate_width = width;
-                }
-            } else if c != ' ' && first_non_whitespace_ix.is_some() {
+            let may_start_line = match &line_start_offsets {
+                Some(offsets) => offsets.binary_search(&ix).is_ok(),
+                None if Self::is_word_char(c) => prev_c == ' ',
+                None => c != ' ',
+            };
+            if may_start_line && first_non_whitespace_ix.is_some() {
                 last_candidate_ix = ix;
                 last_candidate_width = width;
             }
@@ -452,12 +454,19 @@ impl LineWrapper {
 
             if line < max_lines - 1 {
                 // Before the last line: replicate wrap_line's boundary logic.
-                if width > wrap_width && ix > last_wrap_ix {
+                let hangs_past_line_end =
+                    line_start_offsets.is_some() && LineBreaking::hangs_past_line_end(c);
+                let wraps_at_candidate = last_candidate_ix > last_wrap_ix;
+                if width > wrap_width
+                    && ix > last_wrap_ix
+                    && !hangs_past_line_end
+                    && (wraps_at_candidate || line_breaking.overflow_wrap == OverflowWrap::Anywhere)
+                {
                     if let (None, Some(first_nw)) = (indent, first_non_whitespace_ix) {
                         indent = Some(Self::MAX_INDENT.min((first_nw - last_wrap_ix) as u32));
                     }
 
-                    if last_candidate_ix > last_wrap_ix {
+                    if wraps_at_candidate {
                         last_wrap_ix = last_candidate_ix;
                         width -= last_candidate_width;
                         last_candidate_ix = 0;
@@ -1292,6 +1301,47 @@ mod tests {
     #[cfg(target_os = "macos")]
     use crate as gpui;
 
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn test_shape_text_wraps_each_line_breaking_apart(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = "aaaa bbbb/cccc".into();
+            let run = TextRun {
+                len: text.len(),
+                font: font("Helvetica"),
+                ..Default::default()
+            };
+            let second_line_start = |line_breaking| {
+                let lines = text_system
+                    .shape_text_with_line_breaking(
+                        text.clone(),
+                        px(16.),
+                        std::slice::from_ref(&run),
+                        Some(px(90.)),
+                        None,
+                        line_breaking,
+                    )
+                    .unwrap();
+                let layout = &lines[0].layout;
+                let boundary = layout.wrap_boundaries()[0];
+                layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            };
+
+            assert_eq!(
+                second_line_start(LineBreaking::default()),
+                "aaaa bbbb".len()
+            );
+            assert_eq!(
+                second_line_start(LineBreaking {
+                    word_break: crate::WordBreak::KeepAll,
+                    overflow_wrap: crate::OverflowWrap::Anywhere,
+                }),
+                "aaaa ".len()
+            );
+        });
+    }
+
     // These seem to vary wildly based on the text system.
     #[cfg(target_os = "macos")]
     #[crate::test]
@@ -1376,6 +1426,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         // The truncated text, when wrapped, must fit within max_lines lines.
@@ -1421,6 +1472,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         assert_eq!(
@@ -1446,6 +1498,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         let wrap_count = wrapper
@@ -1491,6 +1544,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         // The newline should be preserved.
@@ -1538,6 +1592,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         let parts: Vec<&str> = truncated.splitn(2, '\n').collect();
@@ -1642,6 +1697,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         assert!(
@@ -1669,6 +1725,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         assert_eq!(

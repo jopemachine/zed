@@ -7,9 +7,9 @@ use std::{
 use crate::{
     AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
-    point, px, quad, rems, size,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, LineBreaking,
+    Pixels, Point, PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun,
+    Window, black, phi, point, px, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
@@ -402,6 +402,38 @@ pub enum WhiteSpace {
     Nowrap,
 }
 
+/// Where a wrapped line of text may break between two characters, like CSS `word-break`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum WordBreak {
+    /// After a space that precedes a word, and before any character that is not a word character
+    /// ([`LineWrapper::is_word_char`](crate::LineWrapper::is_word_char)). Hangul letters are word
+    /// characters, so Korean breaks only at spaces, while a CJK ideograph or punctuation such as
+    /// `/`, `(` or `?` allows a break before it.
+    #[default]
+    WordCharacters,
+    /// CSS `word-break: normal`: at the line break opportunities of the Unicode line breaking
+    /// algorithm (UAX #14), which include the places between two Hangul syllables or two CJK
+    /// ideographs.
+    Normal,
+    /// CSS `word-break: keep-all`: as [`WordBreak::Normal`], but never between two letters or
+    /// digits, so Hangul and CJK ideographs break only where punctuation or a space allows it.
+    KeepAll,
+    /// CSS `word-break: break-all`: as [`WordBreak::Normal`], and also between two letters or
+    /// digits of any script.
+    BreakAll,
+}
+
+/// Whether a word wider than its line breaks inside, like CSS `overflow-wrap`.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum OverflowWrap {
+    /// CSS `overflow-wrap: anywhere`, or `break-word`, which wraps a line the same way: the word
+    /// breaks between the two characters where it reaches the end of the line.
+    #[default]
+    Anywhere,
+    /// CSS `overflow-wrap: normal`: the word stays whole and extends past the end of the line.
+    Normal,
+}
+
 /// How to truncate text that overflows the width of the element
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum TextOverflow {
@@ -472,6 +504,12 @@ pub struct TextStyle {
     /// How to handle whitespace in the text
     pub white_space: WhiteSpace,
 
+    /// Where a wrapped line may break between two characters
+    pub word_break: WordBreak,
+
+    /// Whether a word wider than its line breaks inside
+    pub overflow_wrap: OverflowWrap,
+
     /// The text should be truncated if it overflows the width of the element
     pub text_overflow: Option<TextOverflow>,
 
@@ -498,6 +536,8 @@ impl Default for TextStyle {
             underline: None,
             strikethrough: None,
             white_space: WhiteSpace::Normal,
+            word_break: WordBreak::default(),
+            overflow_wrap: OverflowWrap::default(),
             text_overflow: None,
             text_align: TextAlign::default(),
             line_clamp: None,
@@ -547,6 +587,14 @@ impl TextStyle {
             fallbacks: self.font_fallbacks.clone(),
             weight: self.font_weight,
             style: self.font_style,
+        }
+    }
+
+    /// Where wrapping may break the lines of this text.
+    pub fn line_breaking(&self) -> LineBreaking {
+        LineBreaking {
+            word_break: self.word_break,
+            overflow_wrap: self.overflow_wrap,
         }
     }
 

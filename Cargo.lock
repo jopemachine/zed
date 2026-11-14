@@ -7385,6 +7385,7 @@ dependencies = [
  "hdrhistogram",
  "heapless",
  "http_client",
+ "icu_properties",
  "icu_segmenter",
  "image",
  "inventory",

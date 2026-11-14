@@ -1,4 +1,4 @@
-use crate::{FontId, Pixels, SharedString, TextRun, TextSystem, px};
+use crate::{FontId, LineBreaking, OverflowWrap, Pixels, SharedString, TextRun, TextSystem, px};
 use collections::HashMap;
 use std::{borrow::Cow, iter, sync::Arc};
 use unicode_segmentation::UnicodeSegmentation;
@@ -420,6 +420,7 @@ impl LineWrapper {
         truncation_affix: &str,
         runs: &'a [TextRun],
         truncate_from: TruncateFrom,
+        line_breaking: LineBreaking,
     ) -> (SharedString, Cow<'a, [TextRun]>) {
         if max_lines <= 1 || truncate_from == TruncateFrom::Start {
             return self.truncate_line(
@@ -448,7 +449,8 @@ impl LineWrapper {
         let mut indent: Option<u32> = None;
         let mut truncate_ix = 0usize;
 
-        let mut break_indices = Self::break_indices(&text).peekable();
+        let mut break_indices = line_breaking.break_indices(&text).peekable();
+        let hangs_spaces = line_breaking.hangs_spaces_past_line_end();
         for (ix, c) in text.char_indices() {
             // Consume boundaries on newlines too, so skipping an empty line does not
             // leave the iterator stuck before subsequent text.
@@ -497,12 +499,18 @@ impl LineWrapper {
 
             if line < max_lines - 1 {
                 // Before the last line: replicate wrap_line's boundary logic.
-                if width > wrap_width && ix > last_wrap_ix {
+                let hangs_past_line_end = hangs_spaces && LineBreaking::hangs_past_line_end(c);
+                let wraps_at_candidate = last_candidate_ix > last_wrap_ix;
+                if width > wrap_width
+                    && ix > last_wrap_ix
+                    && !hangs_past_line_end
+                    && (wraps_at_candidate || line_breaking.overflow_wrap == OverflowWrap::Anywhere)
+                {
                     if let (None, Some(first_nw)) = (indent, first_non_whitespace_ix) {
                         indent = Some(Self::MAX_INDENT.min((first_nw - last_wrap_ix) as u32));
                     }
 
-                    if last_candidate_ix > last_wrap_ix {
+                    if wraps_at_candidate {
                         last_wrap_ix = last_candidate_ix;
                         width -= last_candidate_width;
                         last_candidate_ix = 0;
@@ -544,6 +552,50 @@ impl LineWrapper {
         // Text fits within max_lines without truncation.
         drop(break_indices);
         (text, Cow::Borrowed(runs))
+    }
+
+    /// Any character in this list should be treated as a word character,
+    /// meaning it can be part of a word that should not be wrapped.
+    pub(crate) fn is_word_char(c: char) -> bool {
+        // ASCII alphanumeric characters, for English, numbers: `Hello123`, etc.
+        c.is_ascii_alphanumeric() ||
+        // Latin script in Unicode for French, German, Spanish, etc.
+        // Latin-1 Supplement
+        // https://en.wikipedia.org/wiki/Latin-1_Supplement
+        matches!(c, '\u{00C0}'..='\u{00FF}') ||
+        // Latin Extended-A
+        // https://en.wikipedia.org/wiki/Latin_Extended-A
+        matches!(c, '\u{0100}'..='\u{017F}') ||
+        // Latin Extended-B
+        // https://en.wikipedia.org/wiki/Latin_Extended-B
+        matches!(c, '\u{0180}'..='\u{024F}') ||
+        // Cyrillic for Russian, Ukrainian, etc.
+        // https://en.wikipedia.org/wiki/Cyrillic_script_in_Unicode
+        matches!(c, '\u{0400}'..='\u{04FF}') ||
+
+        // Vietnamese (https://vietunicode.sourceforge.net/charset/)
+        matches!(c, '\u{1E00}'..='\u{1EFF}') || // Latin Extended Additional
+        matches!(c, '\u{0300}'..='\u{036F}') || // Combining Diacritical Marks
+
+        // Bengali (https://en.wikipedia.org/wiki/Bengali_(Unicode_block))
+        matches!(c, '\u{0980}'..='\u{09FF}') ||
+
+        // Some other known special characters that should be treated as word characters,
+        // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
+        // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
+        // is included so it stays attached to the preceding word when wrapping.
+        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
+        // Closing punctuation never starts a line (UAX #14 LB13: no break
+        // before `!`, `)`, `]`, `}`, closing quotes or an ellipsis) — `plz!`,
+        // `see)`, `quoted”` wrap as one word instead of orphaning the mark on
+        // the next line. `/` and `?` stay break opportunities so long paths
+        // and URLs (`a/b`, `foo?b=2`) can wrap.
+        matches!(c, '!' | ')' | ']' | '}' | '"' | '”' | '»' | '…') ||
+        // `⋯` character is special used in Zed, to keep this at the end of the line.
+        matches!(c, '⋯') ||
+
+        // Non-breaking glue characters
+        matches!(c, '\u{202F}' | '\u{00A0}' | '\u{2011}')
     }
 
     /// The byte offsets in `text` at which a line break is allowed.
@@ -1402,9 +1454,131 @@ mod tests {
         perform_test("abcdefgh…", &[4, 4, 4], &[4, 4, 3]);
     }
 
+    #[test]
+    fn test_is_word_char() {
+        #[track_caller]
+        fn assert_word(word: &str) {
+            for c in word.chars() {
+                assert!(
+                    LineWrapper::is_word_char(c),
+                    "assertion failed for '{}' (unicode 0x{:x})",
+                    c,
+                    c as u32
+                );
+            }
+        }
+
+        #[track_caller]
+        fn assert_not_word(word: &str) {
+            let found = word.chars().any(|c| !LineWrapper::is_word_char(c));
+            assert!(found, "assertion failed for '{}'", word);
+        }
+
+        assert_word("Hello123");
+        assert_word("non-English");
+        assert_word("var_name");
+        assert_word("123456");
+        assert_word("3.1415");
+        assert_word("10^2");
+        assert_word("1~2");
+        assert_word("100%");
+        assert_word("@mention");
+        assert_word("#hashtag");
+        assert_word("$variable");
+        assert_word("a=1");
+        assert_word("Self::is_word_char");
+        assert_word("on;");
+        assert_word("more⋯");
+        assert_word("won’t");
+        assert_word("‘twas");
+        assert_word("plz!");
+        assert_word("see)");
+        assert_word("quoted”");
+        assert_word("well…");
+
+        // Space
+        assert_not_word("foo bar");
+
+        // URL case
+        assert_word("github.com");
+        assert_not_word("zed-industries/zed");
+        assert_not_word("zed-industries\\zed");
+        assert_not_word("a=1&b=2");
+        assert_not_word("foo?b=2");
+
+        // Latin-1 Supplement
+        assert_word("ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏ");
+        // Latin Extended-A
+        assert_word("ĀāĂăĄąĆćĈĉĊċČčĎď");
+        // Latin Extended-B
+        assert_word("ƀƁƂƃƄƅƆƇƈƉƊƋƌƍƎƏ");
+        // Cyrillic
+        assert_word("АБВГДЕЖЗИЙКЛМНОП");
+        // Vietnamese (https://github.com/zed-industries/zed/issues/23245)
+        assert_word("ThậmchíđếnkhithuachạychúngcònnhẫntâmgiếtnốtsốđôngtùchínhtrịởYênBáivàCaoBằng");
+        // Bengali
+        assert_word("গিয়েছিলেন");
+        assert_word("ছেলে");
+        assert_word("হচ্ছিল");
+
+        // non-word characters
+        assert_not_word("你好");
+        assert_not_word("안녕하세요");
+        assert_not_word("こんにちは");
+        assert_not_word("😀😁😂");
+        assert_not_word("()[]{}<>");
+
+        // Non-breaking ("Glue") characters, see https://www.unicode.org/reports/tr14/
+        // (https://github.com/zed-industries/zed/issues/59664)
+        assert_word("\u{202F}"); // NNBSP " "
+        assert_word("\u{00A0}"); // NBSP " "
+        assert_word("\u{2011}"); // NBH "‑"
+    }
+
     // For compatibility with the test macro
     #[cfg(target_os = "macos")]
     use crate as gpui;
+
+    #[cfg(target_os = "macos")]
+    #[crate::test]
+    fn test_shape_text_wraps_each_line_breaking_apart(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let text_system = WindowTextSystem::new(cx.text_system().clone());
+            let text: SharedString = "aaaa bbbb/cccc".into();
+            let run = TextRun {
+                len: text.len(),
+                font: font("Helvetica"),
+                ..Default::default()
+            };
+            let second_line_start = |line_breaking| {
+                let lines = text_system
+                    .shape_text_with_line_breaking(
+                        text.clone(),
+                        px(16.),
+                        std::slice::from_ref(&run),
+                        Some(px(90.)),
+                        None,
+                        line_breaking,
+                    )
+                    .unwrap();
+                let layout = &lines[0].layout;
+                let boundary = layout.wrap_boundaries()[0];
+                layout.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            };
+
+            assert_eq!(
+                second_line_start(LineBreaking::default()),
+                "aaaa bbbb".len()
+            );
+            assert_eq!(
+                second_line_start(LineBreaking {
+                    word_break: crate::WordBreak::KeepAll,
+                    overflow_wrap: crate::OverflowWrap::Anywhere,
+                }),
+                "aaaa ".len()
+            );
+        });
+    }
 
     // These seem to vary wildly based on the text system.
     #[cfg(target_os = "macos")]
@@ -1490,6 +1664,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         // The truncated text, when wrapped, must fit within max_lines lines.
@@ -1535,6 +1710,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         assert_eq!(
@@ -1560,6 +1736,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         let wrap_count = wrapper
@@ -1599,6 +1776,7 @@ mod tests {
                 "…",
                 &runs,
                 TruncateFrom::End,
+                LineBreaking::default(),
             );
             assert_eq!(
                 truncated.as_ref(),
@@ -1628,6 +1806,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         // The newline should be preserved.
@@ -1675,6 +1854,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         let parts: Vec<&str> = truncated.splitn(2, '\n').collect();
@@ -1779,6 +1959,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         assert!(
@@ -1806,6 +1987,7 @@ mod tests {
             "\u{2026}",
             &runs,
             TruncateFrom::End,
+            LineBreaking::default(),
         );
 
         assert_eq!(

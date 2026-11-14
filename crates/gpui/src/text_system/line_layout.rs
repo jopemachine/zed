@@ -1,4 +1,7 @@
-use crate::{FontId, GlyphId, Pixels, PlatformTextSystem, Point, SharedString, Size, point, px};
+use crate::{
+    FontId, GlyphId, LineBreaking, OverflowWrap, Pixels, PlatformTextSystem, Point, SharedString,
+    Size, point, px,
+};
 use collections::{FxHashMap, FxHashSet};
 use itertools::Itertools;
 use smallvec::SmallVec;
@@ -12,8 +15,6 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-
-use super::LineWrapper;
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -192,6 +193,7 @@ impl LineLayout {
         text: &str,
         wrap_width: Pixels,
         max_lines: Option<usize>,
+        line_breaking: LineBreaking,
         scratch: &mut WrapScratch,
     ) -> SmallVec<[WrapBoundary; 1]> {
         let mut boundaries = SmallVec::new();
@@ -216,8 +218,12 @@ impl LineLayout {
                 .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.index)),
         );
         break_indices.clear();
-        break_indices
-            .extend(LineWrapper::break_indices(text).filter(|index| glyph_indices.contains(index)));
+        break_indices.extend(
+            line_breaking
+                .break_indices(text)
+                .filter(|index| glyph_indices.contains(index)),
+        );
+        let hangs_spaces = line_breaking.hangs_spaces_past_line_end();
         let mut glyphs = self
             .runs
             .iter()
@@ -264,23 +270,32 @@ impl LineLayout {
 
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
+            let hangs_past_line_end = hangs_spaces
+                && text[index..]
+                    .chars()
+                    .next()
+                    .is_some_and(LineBreaking::hangs_past_line_end);
 
-            if width > wrap_width && boundary > last_boundary {
-                // When used line_clamp, we should limit the number of lines.
-                if let Some(max_lines) = max_lines
-                    && boundaries.len() >= max_lines.saturating_sub(1)
-                {
-                    break;
-                }
+            if width > wrap_width && boundary > last_boundary && !hangs_past_line_end {
+                let next_boundary = match last_candidate_ix.take() {
+                    Some(candidate) => Some((candidate, last_candidate_x)),
+                    None => match line_breaking.overflow_wrap {
+                        OverflowWrap::Anywhere => Some((boundary, x)),
+                        OverflowWrap::Normal => None,
+                    },
+                };
+                if let Some((next_boundary, next_boundary_x)) = next_boundary {
+                    // When used line_clamp, we should limit the number of lines.
+                    if let Some(max_lines) = max_lines
+                        && boundaries.len() >= max_lines.saturating_sub(1)
+                    {
+                        break;
+                    }
 
-                if let Some(last_candidate_ix) = last_candidate_ix.take() {
-                    last_boundary = last_candidate_ix;
-                    last_boundary_x = last_candidate_x;
-                } else {
-                    last_boundary = boundary;
-                    last_boundary_x = x;
+                    last_boundary = next_boundary;
+                    last_boundary_x = next_boundary_x;
+                    boundaries.push(last_boundary);
                 }
-                boundaries.push(last_boundary);
             }
         }
 
@@ -596,6 +611,7 @@ impl LineLayoutCache {
         runs: &[FontRun],
         wrap_width: Option<Pixels>,
         max_lines: Option<usize>,
+        line_breaking: LineBreaking,
     ) -> Arc<WrappedLineLayout>
     where
         Text: AsRef<str>,
@@ -608,6 +624,7 @@ impl LineLayoutCache {
             runs,
             wrap_width,
             force_width: None,
+            line_breaking,
         } as &dyn AsCacheKeyRef;
 
         let state = self.state.borrow();
@@ -634,6 +651,7 @@ impl LineLayoutCache {
                     text.as_ref(),
                     wrap_width,
                     max_lines,
+                    line_breaking,
                     &mut self.wrap_scratch.borrow_mut(),
                 )
             } else {
@@ -650,6 +668,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width,
                 force_width: None,
+                line_breaking,
             });
 
             let mut state = self.state.borrow_mut();
@@ -681,6 +700,7 @@ impl LineLayoutCache {
             runs,
             wrap_width: None,
             force_width,
+            line_breaking: LineBreaking::default(),
         } as &dyn AsCacheKeyRef;
 
         let state = self.state.borrow();
@@ -714,6 +734,7 @@ impl LineLayoutCache {
                 runs: SmallVec::from(runs),
                 wrap_width: None,
                 force_width,
+                line_breaking: LineBreaking::default(),
             });
             let layout = Arc::new(layout);
             current_frame.lines.insert(key.clone(), layout.clone());
@@ -789,6 +810,7 @@ struct CacheKey {
     runs: SmallVec<[FontRun; 1]>,
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    line_breaking: LineBreaking,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -798,6 +820,7 @@ struct CacheKeyRef<'a> {
     runs: &'a [FontRun],
     wrap_width: Option<Pixels>,
     force_width: Option<Pixels>,
+    line_breaking: LineBreaking,
 }
 
 impl PartialEq for dyn AsCacheKeyRef + '_ {
@@ -822,6 +845,7 @@ impl AsCacheKeyRef for CacheKey {
             runs: self.runs.as_slice(),
             wrap_width: self.wrap_width,
             force_width: self.force_width,
+            line_breaking: self.line_breaking,
         }
     }
 }
@@ -853,7 +877,7 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlyphId, NoopTextSystem, TextRun, TextSystem, WindowTextSystem, font};
+    use crate::{GlyphId, NoopTextSystem, TextRun, TextSystem, WindowTextSystem, WordBreak, font};
 
     #[test]
     fn shape_line_shares_its_text_with_the_layout_cache() {
@@ -916,7 +940,13 @@ mod tests {
         layout.len = "你好".len();
         assert_eq!(
             layout
-                .compute_wrap_boundaries("你好", px(15.), None, &mut WrapScratch::default())
+                .compute_wrap_boundaries(
+                    "你好",
+                    px(15.),
+                    None,
+                    LineBreaking::default(),
+                    &mut WrapScratch::default()
+                )
                 .as_slice(),
             &[WrapBoundary {
                 run_ix: 0,
@@ -929,10 +959,23 @@ mod tests {
         layout.len = 1;
         assert!(
             layout
-                .compute_wrap_boundaries("a", px(10.), None, &mut WrapScratch::default())
+                .compute_wrap_boundaries(
+                    "a",
+                    px(10.),
+                    None,
+                    LineBreaking::default(),
+                    &mut WrapScratch::default()
+                )
                 .is_empty()
         );
     }
+
+    // The word-character rule breaks between any two Hebrew letters, so these tests follow the
+    // Unicode line breaking algorithm, which keeps words whole and breaks after a hyphen.
+    const UNICODE_LINE_BREAKING: LineBreaking = LineBreaking {
+        word_break: WordBreak::Normal,
+        overflow_wrap: OverflowWrap::Anywhere,
+    };
 
     #[test]
     fn test_wrap_right_to_left_text() {
@@ -950,7 +993,13 @@ mod tests {
             layout.width = px(indices.len() as f32 * 10.);
             layout.len = text.len();
             assert_eq!(
-                layout.compute_wrap_boundaries(text, px(40.), None, &mut WrapScratch::default()),
+                layout.compute_wrap_boundaries(
+                    text,
+                    px(40.),
+                    None,
+                    UNICODE_LINE_BREAKING,
+                    &mut WrapScratch::default()
+                ),
                 expected_boundaries
                     .into_iter()
                     .map(|glyph_ix| WrapBoundary {
@@ -976,7 +1025,13 @@ mod tests {
         layout.len = text.len();
         assert_eq!(
             layout
-                .compute_wrap_boundaries(text, px(60.), None, &mut WrapScratch::default())
+                .compute_wrap_boundaries(
+                    text,
+                    px(60.),
+                    None,
+                    UNICODE_LINE_BREAKING,
+                    &mut WrapScratch::default()
+                )
                 .as_slice(),
             &[WrapBoundary {
                 run_ix: 0,
@@ -1084,5 +1139,110 @@ mod tests {
 
         let positions = glyph_x_positions(&layout);
         assert_eq!(positions, vec![0.5, 0.5]);
+    }
+
+    /// A layout of `text` in which every character is one glyph 10px wide.
+    fn monospaced_layout(text: &str) -> LineLayout {
+        let glyphs = text
+            .char_indices()
+            .enumerate()
+            .map(|(column, (index, _))| glyph_at(column as f32 * 10., index))
+            .collect();
+        LineLayout {
+            width: px(text.chars().count() as f32 * 10.),
+            len: text.len(),
+            ..make_layout(glyphs)
+        }
+    }
+
+    #[derive(Debug)]
+    struct WrappedLinesCase {
+        text: &'static str,
+        wrap_width: f32,
+        line_breaking: LineBreaking,
+        lines: &'static [&'static str],
+    }
+
+    #[test]
+    fn test_compute_wrap_boundaries_with_line_breaking() {
+        let breaking = |word_break, overflow_wrap| LineBreaking {
+            word_break,
+            overflow_wrap,
+        };
+        let cases = [
+            WrappedLinesCase {
+                text: "날짜 (Asia/Seoul)",
+                wrap_width: 130.,
+                line_breaking: LineBreaking::default(),
+                lines: &["날짜 (Asia", "/Seoul)"],
+            },
+            WrappedLinesCase {
+                text: "날짜 (Asia/Seoul)",
+                wrap_width: 130.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["날짜 ", "(Asia/Seoul)"],
+            },
+            WrappedLinesCase {
+                text: "가나 다라마바사",
+                wrap_width: 50.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["가나 ", "다라마바사"],
+            },
+            WrappedLinesCase {
+                text: "가나 다라마바사",
+                wrap_width: 50.,
+                line_breaking: breaking(WordBreak::Normal, OverflowWrap::Anywhere),
+                lines: &["가나 다라", "마바사"],
+            },
+            WrappedLinesCase {
+                text: "ab cdefg",
+                wrap_width: 50.,
+                line_breaking: breaking(WordBreak::BreakAll, OverflowWrap::Anywhere),
+                lines: &["ab cd", "efg"],
+            },
+            WrappedLinesCase {
+                text: "abcd efg",
+                wrap_width: 40.,
+                line_breaking: LineBreaking::default(),
+                lines: &["abcd", " efg"],
+            },
+            WrappedLinesCase {
+                text: "abcd efg",
+                wrap_width: 40.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["abcd ", "efg"],
+            },
+            WrappedLinesCase {
+                text: "abcdefgh ij",
+                wrap_width: 40.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Anywhere),
+                lines: &["abcd", "efgh ", "ij"],
+            },
+            WrappedLinesCase {
+                text: "abcdefgh ij",
+                wrap_width: 40.,
+                line_breaking: breaking(WordBreak::KeepAll, OverflowWrap::Normal),
+                lines: &["abcdefgh ", "ij"],
+            },
+        ];
+        for case in cases {
+            let layout = monospaced_layout(case.text);
+            let boundaries = layout.compute_wrap_boundaries(
+                case.text,
+                px(case.wrap_width),
+                None,
+                case.line_breaking,
+                &mut WrapScratch::default(),
+            );
+            let mut lines = Vec::new();
+            let mut line_start = 0;
+            for boundary in boundaries {
+                let line_end = layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                lines.push(&case.text[line_start..line_end]);
+                line_start = line_end;
+            }
+            lines.push(&case.text[line_start..]);
+            assert_eq!(lines, case.lines, "{case:?}");
+        }
     }
 }

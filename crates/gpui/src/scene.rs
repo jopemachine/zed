@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Path,
     PathTiles, Pixels, Point, Radians, ScaledPixels, Size, TimedTransformation,
-    bounds_tree::BoundsTree,
+    bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
@@ -61,6 +61,7 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     animations: Vec<SpriteAnimation>,
+    element_scales: Vec<ElementScale>,
 }
 
 #[expect(missing_docs)]
@@ -70,6 +71,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.layers.clear();
+        self.element_scales.clear();
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -164,7 +166,26 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        self.try_insert_primitive(primitive.into());
+        let mut primitive = primitive.into();
+        for scale in self.element_scales.iter().rev() {
+            scale.apply_to(&mut primitive);
+        }
+        self.try_insert_primitive(primitive);
+    }
+
+    /// Scales the primitives inserted from now on until [`Self::pop_element_scale`], after any
+    /// scale pushed later.
+    pub(crate) fn push_element_scale(&mut self, scale: ElementScale) {
+        self.element_scales.push(scale);
+    }
+
+    pub(crate) fn pop_element_scale(&mut self) {
+        self.element_scales.pop();
+    }
+
+    /// The scales the primitives inserted now take, the one pushed last first.
+    pub(crate) fn element_scales(&self) -> impl Iterator<Item = &ElementScale> {
+        self.element_scales.iter().rev()
     }
 
     /// Returns whether the primitive was kept, rather than clipped away.
@@ -235,7 +256,7 @@ impl Scene {
                     {
                         self.insert_animated_sprite(*sprite, *animation);
                     } else {
-                        self.insert_primitive(primitive.clone());
+                        self.try_insert_primitive(primitive.clone());
                     }
                 }
                 PaintOperation::StartLayer => self.push_layer(),
@@ -809,6 +830,138 @@ pub enum BorderStyle {
     Dashed = 1,
 }
 
+/// A scale about a point that every primitive an element paints takes, as a CSS `scale` transform
+/// with a `transform-origin` scales an element and all it paints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ElementScale {
+    /// The point that stays where it is.
+    pub(crate) origin: Point<ScaledPixels>,
+    pub(crate) factor: f32,
+    /// The clip the element is under from outside it, which its scaled primitives stay inside.
+    pub(crate) outer_clip: Bounds<ScaledPixels>,
+}
+
+impl ElementScale {
+    fn length(&self, length: ScaledPixels) -> ScaledPixels {
+        length * self.factor
+    }
+
+    fn point(&self, at: Point<ScaledPixels>) -> Point<ScaledPixels> {
+        point(
+            self.origin.x + (at.x - self.origin.x) * self.factor,
+            self.origin.y + (at.y - self.origin.y) * self.factor,
+        )
+    }
+
+    fn bounds(&self, bounds: Bounds<ScaledPixels>) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: self.point(bounds.origin),
+            size: bounds.size.map(|length| self.length(length)),
+        }
+    }
+
+    fn content_mask(&self, mask: &ContentMask<ScaledPixels>) -> ContentMask<ScaledPixels> {
+        ContentMask {
+            bounds: self.bounds(mask.bounds).intersect(&self.outer_clip),
+        }
+    }
+
+    fn corners(&self, corners: &Corners<ScaledPixels>) -> Corners<ScaledPixels> {
+        corners.map(|radius| self.length(*radius))
+    }
+
+    /// The transformation that draws a sprite whose bounds were scaled where its old
+    /// transformation would have drawn it before the scale: the scale is taken about the point
+    /// the old transformation moves `origin` to.
+    fn transformation(&self, transformation: TransformationMatrix) -> TransformationMatrix {
+        if transformation == TransformationMatrix::unit() {
+            return transformation;
+        }
+        let [[a, b], [c, d]] = transformation.rotation_scale;
+        let (x, y) = (self.origin.x.0, self.origin.y.0);
+        let unscaled_part = 1. - self.factor;
+        TransformationMatrix {
+            rotation_scale: transformation.rotation_scale,
+            translation: [
+                transformation.translation[0] * self.factor + unscaled_part * (x - (a * x + b * y)),
+                transformation.translation[1] * self.factor + unscaled_part * (y - (c * x + d * y)),
+            ],
+        }
+    }
+
+    /// `path`, in logical pixels at `scale_factor`, scaled as this scale scales what is painted.
+    pub(crate) fn path(&self, path: &Path, scale_factor: f32) -> Path {
+        path.scaled_about(
+            point(
+                self.origin.x.0 / scale_factor,
+                self.origin.y.0 / scale_factor,
+            ),
+            self.factor,
+        )
+    }
+
+    /// `mask`, in logical pixels at `scale_factor`, scaled and clipped as this scale scales and
+    /// clips the content mask of what is painted.
+    pub(crate) fn logical_content_mask(
+        &self,
+        mask: &ContentMask<Pixels>,
+        scale_factor: f32,
+    ) -> ContentMask<Pixels> {
+        ContentMask {
+            bounds: self
+                .content_mask(&mask.scale(scale_factor))
+                .bounds
+                .map(|length| Pixels(length.0 / scale_factor)),
+        }
+    }
+
+    fn apply_to(&self, primitive: &mut Primitive) {
+        match primitive {
+            Primitive::Shadow(shadow) => {
+                shadow.bounds = self.bounds(shadow.bounds);
+                shadow.content_mask = self.content_mask(&shadow.content_mask);
+                shadow.blur_radius = self.length(shadow.blur_radius);
+                shadow.corner_radii = self.corners(&shadow.corner_radii);
+                shadow.shape_bounds = self.bounds(shadow.shape_bounds);
+                shadow.shape_corner_radii = self.corners(&shadow.shape_corner_radii);
+            }
+            Primitive::Quad(quad) => {
+                quad.bounds = self.bounds(quad.bounds);
+                quad.content_mask = self.content_mask(&quad.content_mask);
+                quad.corner_radii = self.corners(&quad.corner_radii);
+                quad.border_widths = quad.border_widths.map(|width| self.length(*width));
+            }
+            // A painted path is already binned into tiles of device pixels, so
+            // `Window::paint_path` scales the path before binning it.
+            Primitive::Path(_) => {}
+            Primitive::Underline(underline) => {
+                underline.bounds = self.bounds(underline.bounds);
+                underline.content_mask = self.content_mask(&underline.content_mask);
+                underline.thickness = self.length(underline.thickness);
+            }
+            Primitive::MonochromeSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.content_mask(&sprite.content_mask);
+                sprite.transformation = self.transformation(sprite.transformation);
+            }
+            Primitive::SubpixelSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.content_mask(&sprite.content_mask);
+                sprite.transformation = self.transformation(sprite.transformation);
+            }
+            Primitive::PolychromeSprite(sprite) => {
+                sprite.bounds = self.bounds(sprite.bounds);
+                sprite.content_mask = self.content_mask(&sprite.content_mask);
+                sprite.corner_radii = self.corners(&sprite.corner_radii);
+            }
+            Primitive::Surface(surface) => {
+                surface.bounds = self.bounds(surface.bounds);
+                surface.content_mask = self.content_mask(&surface.content_mask);
+            }
+        }
+    }
+}
+
 /// A data type representing a 2 dimensional transformation that can be applied to an element.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
@@ -1163,7 +1316,44 @@ impl From<PaintedPath> for Primitive {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{point, size};
+    use crate::{PathBuilder, black, px, size};
+
+    #[test]
+    fn element_scale_scales_a_path_before_it_is_binned() {
+        let mut builder = PathBuilder::fill();
+        builder.move_to(point(px(10.), px(10.)));
+        builder.line_to(point(px(50.), px(10.)));
+        builder.line_to(point(px(50.), px(30.)));
+        builder.close();
+        let path = builder.build().unwrap();
+        let mask = ContentMask {
+            bounds: Bounds {
+                origin: point(px(0.), px(0.)),
+                size: size(px(100.), px(100.)),
+            },
+        };
+        let scale = ElementScale {
+            origin: point(ScaledPixels(20.), ScaledPixels(20.)),
+            factor: 0.5,
+            outer_clip: Bounds {
+                origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+                size: size(ScaledPixels(200.), ScaledPixels(200.)),
+            },
+        };
+
+        let unscaled = PaintedPath::new(path.clone(), 2., mask, black().into());
+        let scaled = PaintedPath::new(
+            scale.path(&path, 2.),
+            2.,
+            scale.logical_content_mask(&mask, 2.),
+            black().into(),
+        );
+        assert_eq!(scaled.paint.bounds, scale.bounds(unscaled.paint.bounds));
+        assert_eq!(
+            scaled.paint.content_mask,
+            scale.content_mask(&unscaled.paint.content_mask)
+        );
+    }
 
     fn square(x: f32) -> Bounds<ScaledPixels> {
         Bounds {

@@ -402,6 +402,30 @@ impl Path {
         self.even_odd
     }
 
+    /// This path scaled by `factor` about `origin`, in logical pixels.
+    pub(crate) fn scaled_about(&self, origin: Point<f32>, factor: f32) -> Self {
+        let scale_point = |at: Point<f32>| {
+            point(
+                origin.x + (at.x - origin.x) * factor,
+                origin.y + (at.y - origin.y) * factor,
+            )
+        };
+        Self {
+            curves: self
+                .curves
+                .iter()
+                .map(|curve| PathCurve {
+                    p0: scale_point(curve.p0),
+                    p1: scale_point(curve.p1),
+                    a: point(curve.a.x * factor, curve.a.y * factor),
+                    b: point(curve.b.x * factor, curve.b.y * factor),
+                    ..*curve
+                })
+                .collect(),
+            even_odd: self.even_odd,
+        }
+    }
+
     /// Bin the curves into tiles in device pixels, for painting at the given
     /// display scale.
     pub(crate) fn bin(&self, scale: f32) -> PathTiles {

@@ -266,9 +266,13 @@ impl TaffyLayoutEngine {
                         MeasuredSizeRounding::DevicePixel => {
                             snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
                         }
-                        MeasuredSizeRounding::Fractional => measured_size
-                            .map(|length| length.0.max(0.0) * scale_factor)
-                            .into(),
+                        MeasuredSizeRounding::FractionalWidth => taffy::geometry::Size {
+                            width: measured_size.width.0.max(0.0) * scale_factor,
+                            height: ceil_to_device_pixel(
+                                measured_size.height.0.max(0.0),
+                                scale_factor,
+                            ),
+                        },
                     }
                 },
             )
@@ -782,9 +786,9 @@ mod tests {
         );
     }
 
-    /// A leaf as wide as `width` says when measured, like a text.
+    /// A leaf of the size `size` says when measured, like a text.
     struct MeasuredLeaf {
-        width: Pixels,
+        size: Size<Pixels>,
     }
 
     impl crate::IntoElement for MeasuredLeaf {
@@ -814,10 +818,9 @@ mod tests {
             window: &mut Window,
             _: &mut App,
         ) -> (LayoutId, ()) {
-            let width = self.width;
-            let layout_id = window.request_measured_layout(Style::default(), move |_, _, _, _| {
-                size(width, crate::px(10.))
-            });
+            let measured_size = self.size;
+            let layout_id =
+                window.request_measured_layout(Style::default(), move |_, _, _, _| measured_size);
             (layout_id, ())
         }
 
@@ -846,9 +849,10 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct MeasuredRowCase {
+    struct MeasuredLeafCase {
         rounding: MeasuredSizeRounding,
-        next_left: f32,
+        right_of_leaf: f32,
+        under_leaf: f32,
     }
 
     // The test window draws two device pixels to a point.
@@ -860,35 +864,51 @@ mod tests {
         use std::{cell::Cell, rc::Rc};
 
         for case in [
-            MeasuredRowCase {
+            MeasuredLeafCase {
                 rounding: MeasuredSizeRounding::DevicePixel,
-                next_left: 10.5,
+                right_of_leaf: 10.5,
+                under_leaf: 10.5,
             },
-            MeasuredRowCase {
-                rounding: MeasuredSizeRounding::Fractional,
-                next_left: 10.,
+            MeasuredLeafCase {
+                rounding: MeasuredSizeRounding::FractionalWidth,
+                right_of_leaf: 10.,
+                under_leaf: 10.5,
             },
         ] {
             cx.update(|cx| cx.set_measured_size_rounding(case.rounding));
             let cx = cx.add_empty_window();
-            let next_bounds = Rc::new(Cell::new(None));
-            let kept_bounds = next_bounds.clone();
+            let beside_bounds = Rc::new(Cell::new(None));
+            let below_bounds = Rc::new(Cell::new(None));
+            let (kept_beside, kept_below) = (beside_bounds.clone(), below_bounds.clone());
             cx.draw(
                 point(px(0.), px(0.)),
-                size(px(100.), px(20.)),
+                size(px(100.), px(40.)),
                 move |_, _| {
-                    div().flex().child(MeasuredLeaf { width: px(10.2) }).child(
-                        canvas(
-                            move |bounds, _, _| kept_bounds.set(Some(bounds)),
-                            |_, _, _, _| {},
+                    let probe = |kept: Rc<Cell<Option<Bounds<Pixels>>>>| {
+                        canvas(move |bounds, _, _| kept.set(Some(bounds)), |_, _, _, _| {})
+                            .w(px(5.))
+                            .h(px(5.))
+                    };
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .child(MeasuredLeaf {
+                                    size: size(px(10.2), px(10.2)),
+                                })
+                                .child(probe(kept_beside)),
                         )
-                        .w(px(5.))
-                        .h(px(10.)),
-                    )
+                        .child(probe(kept_below))
                 },
             );
-            let next_bounds: Bounds<Pixels> = next_bounds.get().unwrap();
-            assert_eq!(next_bounds.left(), px(case.next_left), "{case:?}");
+            let beside: Bounds<Pixels> = beside_bounds.get().unwrap();
+            let below: Bounds<Pixels> = below_bounds.get().unwrap();
+            assert_eq!(beside.left(), px(case.right_of_leaf), "{case:?}");
+            assert_eq!(below.top(), px(case.under_leaf), "{case:?}");
         }
     }
 }

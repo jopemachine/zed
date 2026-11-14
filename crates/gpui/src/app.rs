@@ -816,11 +816,12 @@ pub enum MeasuredSizeRounding {
     /// Up to whole device pixels, after a text's width is rounded up to a whole point.
     #[default]
     DevicePixel,
-    /// As measured, as a browser lays out boxes in fractions of a pixel. A text's width is rounded
-    /// up to the next 1/64 of a point, as Chromium's `LayoutUnit` holds it, so the text laid out at
-    /// that width keeps its lines. Each element's edges are still snapped to device pixels after
-    /// layout.
-    Fractional,
+    /// The width as measured, as a browser lays out boxes in fractions of a pixel. A text's width
+    /// is rounded up to the next 1/64 of a point, as Chromium's `LayoutUnit` holds it, so the text
+    /// laid out at that width keeps its lines. The height is still rounded up to whole device
+    /// pixels, as a text's line height is, so rows stacked by their text keep their places. Each
+    /// element's edges are still snapped to device pixels after layout.
+    FractionalWidth,
 }
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.

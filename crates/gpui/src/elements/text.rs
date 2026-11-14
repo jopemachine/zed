@@ -776,7 +776,7 @@ impl TextLayout {
                 }
                 size.width = match cx.measured_size_rounding() {
                     MeasuredSizeRounding::DevicePixel => size.width.ceil(),
-                    MeasuredSizeRounding::Fractional => Self::layout_unit_above(size.width),
+                    MeasuredSizeRounding::FractionalWidth => Self::layout_unit_above(size.width),
                 };
 
                 element_state.0.borrow_mut().replace(TextLayoutInner {

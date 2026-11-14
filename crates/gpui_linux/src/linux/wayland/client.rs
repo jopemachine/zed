@@ -2099,6 +2099,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
 
                 state.wl_touch = Some(touch);
+                // A touch screen that appears after the pointer entered the window, or a mouse
+                // plugged into a seat with one, leaves the cursor hidden until the mouse moves.
+                state.hide_cursor_until_mouse_moves();
             }
         }
     }

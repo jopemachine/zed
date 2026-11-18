@@ -1293,11 +1293,7 @@ impl WgpuRendererCore {
             dual_source_blending,
             transient_attachments: context.supports_transient_attachments(),
             adapter_info: context.adapter.get_info(),
-            finishes_queued_writes_before_rendering: context
-                .adapter
-                .get_info()
-                .name
-                .contains("V3D"),
+            finishes_queued_writes_before_rendering: context.adapter_is_v3d(),
             depth_texture: None,
             #[cfg(all(
                 not(target_family = "wasm"),

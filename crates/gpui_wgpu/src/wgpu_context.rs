@@ -746,6 +746,10 @@ impl WgpuContext {
         self.dual_source_blending
     }
 
+    pub(crate) fn adapter_is_v3d(&self) -> bool {
+        self.adapter.get_info().name.contains("V3D")
+    }
+
     pub fn color_texture_format(&self) -> wgpu::TextureFormat {
         self.color_texture_format
     }

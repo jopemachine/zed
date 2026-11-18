@@ -9,6 +9,9 @@ use std::{borrow::Cow, ops, sync::Arc};
 
 use crate::WgpuContext;
 
+/// The side of the tiles V3D renders 8-bit color targets in.
+const V3D_TILE_SIDE: i32 = 64;
+
 fn device_size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
     size2(size.width.0, size.height.0)
 }
@@ -36,6 +39,10 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    /// V3DV copies a region that falls on tile boundaries without loading its tiles first, but
+    /// stores every tile of the supertiles the region touches, so the tiles next to the region
+    /// lose their pixels. A region split in two no longer falls on tile boundaries.
+    splits_tile_aligned_uploads: bool,
 }
 
 pub struct WgpuTextureInfo {
@@ -50,6 +57,24 @@ impl WgpuAtlas {
         queue: Arc<wgpu::Queue>,
         color_texture_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::with_tile_aligned_upload_splitting(device, queue, color_texture_format, false)
+    }
+
+    pub fn from_context(context: &WgpuContext) -> Self {
+        Self::with_tile_aligned_upload_splitting(
+            context.device.clone(),
+            context.queue.clone(),
+            context.color_texture_format(),
+            context.adapter_is_v3d(),
+        )
+    }
+
+    fn with_tile_aligned_upload_splitting(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        color_texture_format: wgpu::TextureFormat,
+        splits_tile_aligned_uploads: bool,
+    ) -> Self {
         let max_texture_size = device.limits().max_texture_dimension_2d;
         WgpuAtlas(Mutex::new(AtlasState::new(WgpuAtlasTextures {
             device,
@@ -59,15 +84,8 @@ impl WgpuAtlas {
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            splits_tile_aligned_uploads,
         })))
-    }
-
-    pub fn from_context(context: &WgpuContext) -> Self {
-        Self::new(
-            context.device.clone(),
-            context.queue.clone(),
-            context.color_texture_format(),
-        )
     }
 
     pub fn before_frame(&self) {
@@ -104,6 +122,7 @@ impl WgpuAtlas {
             textures.device = context.device.clone();
             textures.queue = context.queue.clone();
             textures.color_texture_format = context.color_texture_format();
+            textures.splits_tile_aligned_uploads = context.adapter_is_v3d();
             textures.storage = WgpuAtlasStorage::default();
             textures.pending_uploads.clear();
         });
@@ -212,7 +231,13 @@ impl WgpuAtlasTextures {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: if cfg!(test) {
+                wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
+            },
             view_formats: &[],
         });
 
@@ -269,31 +294,36 @@ impl WgpuAtlasTextures {
             let Some(texture) = self.storage.get(upload.id) else {
                 continue;
             };
-            let bytes_per_pixel = texture.bytes_per_pixel();
-
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: upload.bounds.origin.x.0 as u32,
-                        y: upload.bounds.origin.y.0 as u32,
-                        z: 0,
+            let row_count = upload.bounds.size.height.0;
+            if self.splits_tile_aligned_uploads
+                && row_count > 1
+                && texture.falls_on_v3d_tile_boundaries(upload.bounds)
+            {
+                let first_row_byte_count =
+                    upload.bounds.size.width.0 as usize * texture.bytes_per_pixel() as usize;
+                let (first_row, remaining_rows) = upload.data.split_at(first_row_byte_count);
+                let first_row_bounds = Bounds {
+                    origin: upload.bounds.origin,
+                    size: Size {
+                        width: upload.bounds.size.width,
+                        height: DevicePixels(1),
                     },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &upload.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(upload.bounds.size.width.0 as u32 * bytes_per_pixel as u32),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: upload.bounds.size.width.0 as u32,
-                    height: upload.bounds.size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
+                };
+                let remaining_rows_bounds = Bounds {
+                    origin: Point {
+                        x: upload.bounds.origin.x,
+                        y: upload.bounds.origin.y + DevicePixels(1),
+                    },
+                    size: Size {
+                        width: upload.bounds.size.width,
+                        height: DevicePixels(row_count - 1),
+                    },
+                };
+                texture.queue_region_write(&self.queue, first_row_bounds, first_row);
+                texture.queue_region_write(&self.queue, remaining_rows_bounds, remaining_rows);
+            } else {
+                texture.queue_region_write(&self.queue, upload.bounds, &upload.data);
+            }
         }
     }
 }
@@ -367,6 +397,57 @@ impl WgpuAtlasTexture {
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm => 4,
             _ => 4,
         }
+    }
+
+    fn queue_region_write(
+        &self,
+        queue: &wgpu::Queue,
+        region_bounds: Bounds<DevicePixels>,
+        region_pixels: &[u8],
+    ) {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: region_bounds.origin.x.0 as u32,
+                    y: region_bounds.origin.y.0 as u32,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            region_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(
+                    region_bounds.size.width.0 as u32 * self.bytes_per_pixel() as u32,
+                ),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: region_bounds.size.width.0 as u32,
+                height: region_bounds.size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Whether V3DV takes `region_bounds` for whole tiles: the origin lies on a tile boundary and
+    /// each side ends on one or at the edge of the texture.
+    fn falls_on_v3d_tile_boundaries(&self, region_bounds: Bounds<DevicePixels>) -> bool {
+        let spans_whole_tiles = |origin: i32, length: i32, texture_length: u32| {
+            origin % V3D_TILE_SIDE == 0
+                && (length % V3D_TILE_SIDE == 0 || (origin + length) as u32 >= texture_length)
+        };
+        spans_whole_tiles(
+            region_bounds.origin.x.0,
+            region_bounds.size.width.0,
+            self.texture.width(),
+        ) && spans_whole_tiles(
+            region_bounds.origin.y.0,
+            region_bounds.size.height.0,
+            self.texture.height(),
+        )
     }
 
     fn decrement_ref_count(&mut self) {
@@ -543,6 +624,117 @@ mod tests {
 
         assert_eq!(second_tile.texture_id, first_tile.texture_id);
         assert_ne!(second_generation, first_generation);
+        Ok(())
+    }
+
+    #[test]
+    fn sprites_keep_their_pixels_when_tile_aligned_uploads_are_split() -> anyhow::Result<()> {
+        let (device, queue) = test_device_and_queue()?;
+        let atlas = WgpuAtlas::with_tile_aligned_upload_splitting(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Bgra8Unorm,
+            true,
+        );
+        let sprite_size = Size {
+            width: DevicePixels(V3D_TILE_SIDE),
+            height: DevicePixels(V3D_TILE_SIDE),
+        };
+        let sprite_row_byte_count = V3D_TILE_SIDE as usize * 4;
+        let sprite_byte_count = sprite_row_byte_count * V3D_TILE_SIDE as usize;
+        // Enough sprites for the atlas to place some above others.
+        let sprites = (0..32usize)
+            .map(|sprite_index| {
+                let sprite_pixels = (0..sprite_byte_count)
+                    .map(|byte_index| ((sprite_index * 7 + byte_index) % 255) as u8 + 1)
+                    .collect::<Vec<u8>>();
+                let key = AtlasKey::Image(RenderImageParams {
+                    image_id: ImageId(sprite_index),
+                    frame_index: 0,
+                });
+                let tile = atlas
+                    .get_or_insert_with(key, &mut || {
+                        Ok(Some((sprite_size, Cow::Owned(sprite_pixels.clone()))))
+                    })?
+                    .context("the sprite should get a tile")?;
+                Ok((tile, sprite_pixels))
+            })
+            .collect::<anyhow::Result<Vec<(AtlasTile, Vec<u8>)>>>()?;
+        let texture_id = sprites[0].0.texture_id;
+        assert!(
+            sprites
+                .iter()
+                .all(|(tile, _)| tile.texture_id == texture_id)
+        );
+        let texture = {
+            let lock = atlas.0.lock();
+            let atlas_texture = lock
+                .backend
+                .storage
+                .get(texture_id)
+                .context("the texture should exist")?;
+            assert!(
+                sprites
+                    .iter()
+                    .any(|(tile, _)| atlas_texture.falls_on_v3d_tile_boundaries(tile.bounds))
+            );
+            atlas_texture.texture.clone()
+        };
+
+        atlas.before_frame();
+
+        let texture_row_byte_count = texture.width() * 4;
+        let read_back_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("atlas_read_back"),
+            size: u64::from(texture_row_byte_count) * u64::from(texture.height()),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("atlas_read_back"),
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read_back_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(texture_row_byte_count),
+                    rows_per_image: None,
+                },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        read_back_buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, |result| {
+                result.expect("the read back buffer should map")
+            });
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .map_err(|error| anyhow::anyhow!("failed to wait for the read back: {error:?}"))?;
+        let texture_pixels = read_back_buffer.slice(..).get_mapped_range();
+
+        let bounds_of_damaged_sprites = sprites
+            .iter()
+            .filter(|(tile, sprite_pixels)| {
+                sprite_pixels
+                    .chunks_exact(sprite_row_byte_count)
+                    .enumerate()
+                    .any(|(row, sprite_row)| {
+                        let row_start = (tile.bounds.origin.y.0 as usize + row)
+                            * texture_row_byte_count as usize
+                            + tile.bounds.origin.x.0 as usize * 4;
+                        &texture_pixels[row_start..row_start + sprite_row_byte_count] != sprite_row
+                    })
+            })
+            .map(|(tile, _)| tile.bounds)
+            .collect::<Vec<_>>();
+        assert_eq!(bounds_of_damaged_sprites, Vec::new());
         Ok(())
     }
 

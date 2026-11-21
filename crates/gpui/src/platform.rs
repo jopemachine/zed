@@ -2204,8 +2204,14 @@ impl PlatformInputHandler {
     pub fn selection_bounds_for_range(&mut self, range_utf16: Range<usize>) -> Vec<Bounds<Pixels>> {
         self.cx
             .update(|window, cx| {
-                self.handler
-                    .selection_bounds_for_range(range_utf16, window, cx)
+                let content_scale = window.content_scale();
+                let mut bounds = self
+                    .handler
+                    .selection_bounds_for_range(range_utf16, window, cx);
+                for rect in &mut bounds {
+                    *rect = rect.map(|length| length * content_scale);
+                }
+                bounds
             })
             .unwrap_or_default()
     }

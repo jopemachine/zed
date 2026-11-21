@@ -1313,6 +1313,7 @@ pub struct Window {
     pub(crate) pending_input_observers: SingleSubscriberSet<AnyObserver>,
     prompt: Option<RenderablePromptHandle>,
     pub(crate) client_inset: Option<Pixels>,
+    client_corner_radii: Option<Corners<Pixels>>,
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
@@ -2468,6 +2469,7 @@ impl Window {
             pending_input_observers: SingleSubscriberSet::new(),
             prompt: None,
             client_inset: None,
+            client_corner_radii: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
@@ -3226,7 +3228,16 @@ impl Window {
 
     /// Returns the regions of this window obscured by system UI and the keyboard.
     pub fn insets(&self) -> WindowInsets {
-        self.platform_window.insets()
+        let insets = self.platform_window.insets();
+        if self.content_scale == 1. {
+            return insets;
+        }
+        let to_content_pixels = |length: &Pixels| *length / self.content_scale;
+        WindowInsets {
+            safe_area: insets.safe_area.map(to_content_pixels),
+            ime: insets.ime.map(to_content_pixels),
+            corner_radii: insets.corner_radii.map(to_content_pixels),
+        }
     }
 
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
@@ -3317,17 +3328,12 @@ impl Window {
     /// Intersects the visual viewport with the full layout area inset by system
     /// safe areas and keyboard occlusion. Unknown overlays cannot be excluded.
     pub fn fully_visible_bounds(&self) -> Bounds<Pixels> {
-        let insets = self.platform_window.insets().effective();
-        let content_scale = self.content_scale;
+        let insets = self.insets().effective();
         let viewport = self.viewport_size();
-        let left = (insets.left / content_scale)
-            .max(Pixels::ZERO)
-            .min(viewport.width);
-        let top = (insets.top / content_scale)
-            .max(Pixels::ZERO)
-            .min(viewport.height);
-        let right = (viewport.width - (insets.right / content_scale).max(Pixels::ZERO)).max(left);
-        let bottom = (viewport.height - (insets.bottom / content_scale).max(Pixels::ZERO)).max(top);
+        let left = insets.left.max(Pixels::ZERO).min(viewport.width);
+        let top = insets.top.max(Pixels::ZERO).min(viewport.height);
+        let right = (viewport.width - insets.right.max(Pixels::ZERO)).max(left);
+        let bottom = (viewport.height - insets.bottom.max(Pixels::ZERO)).max(top);
         let safe_bounds = Bounds::from_corners(point(left, top), point(right, bottom));
         let mut visible = safe_bounds.intersect(&self.visual_viewport_bounds());
         visible.size.width = visible.size.width.max(Pixels::ZERO);
@@ -3396,7 +3402,9 @@ impl Window {
 
     /// Sets the client-drawn corner radii so platform effects can match the window's shape.
     pub fn set_client_corner_radii(&mut self, radii: Corners<Pixels>) {
-        self.platform_window.set_client_corner_radii(radii);
+        self.client_corner_radii = Some(radii);
+        self.platform_window
+            .set_client_corner_radii(radii.map(|radius| *radius * self.content_scale));
     }
 
     /// Returns the client_inset value by [`Self::set_client_inset`].
@@ -3512,6 +3520,10 @@ impl Window {
         }
         if let Some(inset) = self.client_inset {
             self.platform_window.set_client_inset(inset * content_scale);
+        }
+        if let Some(radii) = self.client_corner_radii {
+            self.platform_window
+                .set_client_corner_radii(radii.map(|radius| *radius * content_scale));
         }
         self.content_scale = content_scale;
         self.bounds_changed(cx);
@@ -9014,6 +9026,18 @@ mod tests {
             .unwrap();
         assert_eq!(platform_window.virtual_keyboard_requests(), 1);
         assert_eq!(platform_window.virtual_keyboard_dismissals(), 1);
+        window
+            .update(cx, |_, window, cx| {
+                window.set_content_scale(2., cx);
+                assert_eq!(window.insets().safe_area.top, px(30.));
+                assert_eq!(window.insets().ime.bottom, px(175.));
+                assert_eq!(
+                    window.fully_visible_bounds(),
+                    Bounds::new(point(px(5.), px(30.)), size(px(185.), px(195.)))
+                );
+                window.set_content_scale(1., cx);
+            })
+            .unwrap();
 
         platform_window.simulate_insets_change(crate::WindowInsets {
             safe_area: crate::Edges {

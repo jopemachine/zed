@@ -87,6 +87,22 @@ impl Scene {
     /// sprite's color is taken as its color before the animation's alpha.
     pub(crate) fn insert_animated_sprite(
         &mut self,
+        sprite: MonochromeSprite,
+        mut animation: SpriteAnimation,
+    ) {
+        let mut primitive = Primitive::MonochromeSprite(sprite);
+        for scale in self.element_scales.iter().rev() {
+            scale.apply_to(&mut primitive);
+            animation.element_scaling = animation.element_scaling.followed_by(scale);
+        }
+        let Primitive::MonochromeSprite(sprite) = primitive else {
+            unreachable!("an element scale keeps the kind of a primitive");
+        };
+        self.insert_placed_animated_sprite(sprite, animation);
+    }
+
+    fn insert_placed_animated_sprite(
+        &mut self,
         mut sprite: MonochromeSprite,
         mut animation: SpriteAnimation,
     ) {
@@ -120,7 +136,9 @@ impl Scene {
                 continue;
             };
             let pose = animation.transformation.at(elapsed);
-            sprite.transformation = pose.into_matrix(animation.center, animation.scale_factor);
+            sprite.transformation = animation
+                .element_scaling
+                .transformation(pose.into_matrix(animation.center, animation.scale_factor));
             sprite.color = animation.base_color.opacity(pose.alpha_factor());
         }
     }
@@ -254,7 +272,7 @@ impl Scene {
                         && let Some(animation) =
                             prev_scene.animations.get(sprite.animation.0 as usize)
                     {
-                        self.insert_animated_sprite(*sprite, *animation);
+                        self.insert_placed_animated_sprite(*sprite, *animation);
                     } else {
                         self.try_insert_primitive(primitive.clone());
                     }
@@ -874,19 +892,9 @@ impl ElementScale {
     /// transformation would have drawn it before the scale: the scale is taken about the point
     /// the old transformation moves `origin` to.
     fn transformation(&self, transformation: TransformationMatrix) -> TransformationMatrix {
-        if transformation == TransformationMatrix::unit() {
-            return transformation;
-        }
-        let [[a, b], [c, d]] = transformation.rotation_scale;
-        let (x, y) = (self.origin.x.0, self.origin.y.0);
-        let unscaled_part = 1. - self.factor;
-        TransformationMatrix {
-            rotation_scale: transformation.rotation_scale,
-            translation: [
-                transformation.translation[0] * self.factor + unscaled_part * (x - (a * x + b * y)),
-                transformation.translation[1] * self.factor + unscaled_part * (y - (c * x + d * y)),
-            ],
-        }
+        ElementScaling::NONE
+            .followed_by(self)
+            .transformation(transformation)
     }
 
     /// `path`, in logical pixels at `scale_factor`, scaled as this scale scales what is painted.
@@ -958,6 +966,54 @@ impl ElementScale {
                 surface.bounds = self.bounds(surface.bounds);
                 surface.content_mask = self.content_mask(&surface.content_mask);
             }
+        }
+    }
+}
+
+/// Where the element scales a primitive was inserted under move what it draws, as one scale
+/// `x -> factor * x + offset` in scaled pixels. An animated sprite keeps it to move each pose of
+/// its transformation as its bounds were moved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ElementScaling {
+    factor: f32,
+    offset: Point<ScaledPixels>,
+}
+
+impl ElementScaling {
+    pub(crate) const NONE: Self = Self {
+        factor: 1.,
+        offset: Point {
+            x: ScaledPixels(0.),
+            y: ScaledPixels(0.),
+        },
+    };
+
+    /// This scaling, then `scale`.
+    fn followed_by(self, scale: &ElementScale) -> Self {
+        let origin_weight = 1. - scale.factor;
+        Self {
+            factor: self.factor * scale.factor,
+            offset: point(
+                self.offset.x * scale.factor + scale.origin.x * origin_weight,
+                self.offset.y * scale.factor + scale.origin.y * origin_weight,
+            ),
+        }
+    }
+
+    /// The transformation that draws a sprite whose bounds were scaled where `transformation`
+    /// drew it before the scaling.
+    fn transformation(&self, transformation: TransformationMatrix) -> TransformationMatrix {
+        if *self == Self::NONE || transformation == TransformationMatrix::unit() {
+            return transformation;
+        }
+        let [[a, b], [c, d]] = transformation.rotation_scale;
+        let (x, y) = (self.offset.x.0, self.offset.y.0);
+        TransformationMatrix {
+            rotation_scale: transformation.rotation_scale,
+            translation: [
+                transformation.translation[0] * self.factor + x - (a * x + b * y),
+                transformation.translation[1] * self.factor + y - (c * x + d * y),
+            ],
         }
     }
 }
@@ -1131,6 +1187,7 @@ pub(crate) struct SpriteAnimation {
     scale_factor: f32,
     base_color: Hsla,
     sprite_index: usize,
+    element_scaling: ElementScaling,
 }
 
 impl SpriteAnimation {
@@ -1145,6 +1202,7 @@ impl SpriteAnimation {
             scale_factor,
             base_color: Hsla::default(),
             sprite_index: usize::MAX,
+            element_scaling: ElementScaling::NONE,
         }
     }
 }
@@ -1317,6 +1375,78 @@ impl From<PaintedPath> for Primitive {
 mod tests {
     use super::*;
     use crate::{PathBuilder, black, px, size};
+
+    #[test]
+    fn element_scale_moves_each_pose_of_an_animated_sprite() {
+        let outer_clip = Bounds {
+            origin: point(ScaledPixels(0.), ScaledPixels(0.)),
+            size: size(ScaledPixels(200.), ScaledPixels(200.)),
+        };
+        let sprite = MonochromeSprite {
+            order: 0,
+            animation: SpriteAnimationId(0),
+            tile: AtlasTile {
+                texture_id: crate::AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Monochrome,
+                },
+                tile_id: crate::TileId(0),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            bounds: Bounds {
+                origin: point(ScaledPixels(40.), ScaledPixels(40.)),
+                size: size(ScaledPixels(20.), ScaledPixels(20.)),
+            },
+            content_mask: ContentMask { bounds: outer_clip },
+            color: black(),
+            transformation: TransformationMatrix::unit(),
+        };
+        let turning = SpriteAnimation::new(
+            TimedTransformation::rotation(Duration::from_secs(1), crate::Transformation::default()),
+            point(px(25.), px(25.)),
+            2.,
+        );
+        let scale = ElementScale {
+            origin: point(ScaledPixels(10.), ScaledPixels(20.)),
+            factor: 0.5,
+            outer_clip,
+        };
+
+        let mut unscaled = Scene::default();
+        unscaled.insert_animated_sprite(sprite, turning);
+        unscaled.finish();
+        let mut scaled = Scene::default();
+        scaled.push_element_scale(scale);
+        scaled.insert_animated_sprite(sprite, turning);
+        scaled.pop_element_scale();
+        scaled.finish();
+        let quarter_turn = Duration::from_millis(250);
+        unscaled.advance_animations(quarter_turn);
+        scaled.advance_animations(quarter_turn);
+
+        let unscaled_sprite = unscaled.monochrome_sprites[0];
+        let scaled_sprite = scaled.monochrome_sprites[0];
+        assert_eq!(scaled_sprite.bounds, scale.bounds(unscaled_sprite.bounds));
+        assert_ne!(scaled_sprite.transformation, TransformationMatrix::unit());
+        // Each point the scaled sprite draws lands where the unscaled sprite drew it, scaled.
+        let drawn = |transformation: TransformationMatrix, at: Point<ScaledPixels>| {
+            let drawn = transformation.apply(point(px(at.x.0), px(at.y.0)));
+            point(ScaledPixels(drawn.x.0), ScaledPixels(drawn.y.0))
+        };
+        for corner in [
+            unscaled_sprite.bounds.origin,
+            unscaled_sprite.bounds.bottom_right(),
+        ] {
+            let expected = scale.point(drawn(unscaled_sprite.transformation, corner));
+            let actual = drawn(scaled_sprite.transformation, scale.point(corner));
+            assert!(
+                (actual.x.0 - expected.x.0).abs() < 1e-3
+                    && (actual.y.0 - expected.y.0).abs() < 1e-3,
+                "{corner:?} drawn at {actual:?}, expected {expected:?}"
+            );
+        }
+    }
 
     #[test]
     fn element_scale_scales_a_path_before_it_is_binned() {

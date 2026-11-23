@@ -2522,6 +2522,11 @@ impl PlatformWindow for MacWindow {
         NSBeep()
     }
 
+    fn capture_frame(&self, scene: &gpui::Scene) -> Result<gpui::FrameCapture> {
+        let image = self.0.lock().renderer.render_to_image(scene)?;
+        Ok(Box::new(move || Ok(image)))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &gpui::Scene) -> Result<RgbaImage> {
         let mut this = self.0.lock();

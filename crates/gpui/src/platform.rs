@@ -51,10 +51,8 @@ use anyhow::{Context as _, Result};
 use async_task::Runnable;
 use collections::FxHashMap;
 use futures::channel::oneshot;
-#[cfg(any(test, feature = "test-support", feature = "bench-support"))]
-use image::RgbaImage;
 use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
-use image::{DynamicImage, Frame, Rgba};
+use image::{DynamicImage, Frame, Rgba, RgbaImage};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use scheduler::Instant;
 pub use scheduler::RunnableMeta;
@@ -1494,6 +1492,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         None
     }
 
+    /// Draws `scene` into a texture of the window's size, without presenting it, and returns what
+    /// reads the texture back. See [`Window::capture_frame`].
+    fn capture_frame(&self, _scene: &Scene) -> Result<FrameCapture> {
+        anyhow::bail!("capturing a frame is not implemented for this platform")
+    }
+
     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.
@@ -1502,6 +1506,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         anyhow::bail!("render_to_image not implemented for this platform")
     }
 }
+
+/// Finishes the capture of a frame ([`Window::capture_frame`]): waits for the GPU to draw it and
+/// reads its pixels back. It blocks, so run it on a background thread.
+pub type FrameCapture = Box<dyn FnOnce() -> Result<RgbaImage> + Send>;
 
 /// A renderer for headless windows that can produce real rendered output.
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]

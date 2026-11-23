@@ -224,11 +224,8 @@ struct WgpuRendererCore {
     /// V3DV's binner can read instance data before the queued copy that wrote it has finished.
     finishes_queued_writes_before_rendering: bool,
     depth_texture: Option<DepthTexture>,
-    /// Read by the headless renderer to create its render target.
-    #[cfg(all(
-        not(target_family = "wasm"),
-        any(test, feature = "bench-support", feature = "test-support")
-    ))]
+    /// The format of the textures frames are drawn into, for those not acquired from a surface.
+    #[cfg(not(target_family = "wasm"))]
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
 }
@@ -1167,6 +1164,22 @@ impl WgpuRenderer {
         core.resources.queue.present(frame);
         true
     }
+
+    /// Draws `scene` into a texture of its own at the window's size and returns what reads the
+    /// texture back. Only the drawing happens here; the wait for the GPU is left to the caller's
+    /// thread.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn capture_frame(&mut self, scene: &Scene) -> Result<gpui::FrameCapture> {
+        let size = self.viewport_size();
+        let core = self
+            .core_mut()
+            .context("the renderer has no device to capture a frame with")?;
+        let texture = core.create_readable_target(size, "frame_capture_target");
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        core.render_frame(scene, &view, size, wgpu::Color::TRANSPARENT)?;
+        let readback = TextureReadback::start(&core.resources, &texture)?;
+        Ok(Box::new(move || readback.finish()))
+    }
 }
 
 impl WgpuRendererCore {
@@ -1295,10 +1308,7 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             finishes_queued_writes_before_rendering: context.adapter_is_v3d(),
             depth_texture: None,
-            #[cfg(all(
-                not(target_family = "wasm"),
-                any(test, feature = "bench-support", feature = "test-support")
-            ))]
+            #[cfg(not(target_family = "wasm"))]
             target_format,
             max_texture_size,
         }
@@ -1325,6 +1335,27 @@ impl WgpuRendererCore {
 
     fn resources_mut(&mut self) -> &mut WgpuResources {
         &mut self.resources
+    }
+
+    /// A texture frames can be drawn into and read back from.
+    #[cfg(not(target_family = "wasm"))]
+    fn create_readable_target(&self, size: Size<DevicePixels>, label: &str) -> wgpu::Texture {
+        self.resources
+            .device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.width.0 as u32,
+                    height: size.height.0 as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.target_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
     }
 
     fn render_frame(
@@ -2257,6 +2288,135 @@ impl WgpuRenderer {
     }
 }
 
+/// The pixels of a texture on their way back to the CPU.
+#[cfg(not(target_family = "wasm"))]
+struct TextureReadback {
+    device: Arc<wgpu::Device>,
+    buffer: wgpu::Buffer,
+    submission: wgpu::SubmissionIndex,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    padded_bytes_per_row: u32,
+    is_bgra: bool,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl TextureReadback {
+    const WAIT_AT_MOST: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Queues the copy of `texture`, which must hold 8 bits per channel, into a buffer.
+    fn start(resources: &WgpuResources, texture: &wgpu::Texture) -> Result<Self> {
+        let format = texture.format();
+        let is_bgra = match format {
+            wgpu::TextureFormat::Bgra8Unorm => true,
+            wgpu::TextureFormat::Rgba8Unorm => false,
+            _ => anyhow::bail!("cannot read back a texture in the format {format:?}"),
+        };
+        let width = texture.width();
+        let height = texture.height();
+        let bytes_per_row = width
+            .checked_mul(4)
+            .context("the row size of the read back overflowed")?;
+        let padded_bytes_per_row = bytes_per_row
+            .checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            .context("the padded row size of the read back overflowed")?;
+        let buffer_size = u64::from(padded_bytes_per_row)
+            .checked_mul(u64::from(height))
+            .context("the buffer size of the read back overflowed")?;
+        let max_buffer_size = resources.device.limits().max_buffer_size;
+        anyhow::ensure!(
+            buffer_size <= max_buffer_size,
+            "the read back needs a buffer of {buffer_size} bytes, more than the maximum of {max_buffer_size}"
+        );
+        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("texture_readback_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder =
+            resources
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("texture_readback_encoder"),
+                });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        let submission = resources.queue.submit(std::iter::once(encoder.finish()));
+        Ok(Self {
+            device: resources.device.clone(),
+            buffer,
+            submission,
+            width,
+            height,
+            bytes_per_row,
+            padded_bytes_per_row,
+            is_bgra,
+        })
+    }
+
+    /// Waits for the copy and returns its pixels.
+    fn finish(self) -> Result<image::RgbaImage> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                if sender.send(result).is_err() {
+                    log::error!("the read back was dropped before its buffer was mapped");
+                }
+            });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(self.submission),
+                timeout: Some(Self::WAIT_AT_MOST),
+            })
+            .context("waiting for the read back")?;
+        receiver
+            .recv_timeout(Self::WAIT_AT_MOST)
+            .context("waiting for the read back's buffer to be mapped")?
+            .context("mapping the read back's buffer")?;
+
+        let mapped_data = self.buffer.slice(..).get_mapped_range()?;
+        let mut pixels = Vec::with_capacity(self.bytes_per_row as usize * self.height as usize);
+        for row in mapped_data
+            .chunks_exact(self.padded_bytes_per_row as usize)
+            .take(self.height as usize)
+        {
+            pixels.extend_from_slice(&row[..self.bytes_per_row as usize]);
+        }
+        drop(mapped_data);
+        self.buffer.unmap();
+
+        if self.is_bgra {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        image::RgbaImage::from_raw(self.width, self.height, pixels)
+            .context("creating an image from the read back pixels")
+    }
+}
+
 #[cfg(all(
     not(target_family = "wasm"),
     any(test, feature = "bench-support", feature = "test-support")
@@ -2337,22 +2497,7 @@ impl WgpuHeadlessRenderer {
 
         let texture = self
             .core
-            .resources
-            .device
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("headless_render_target"),
-                size: wgpu::Extent3d {
-                    width: size.width.0 as u32,
-                    height: size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.core.target_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
+            .create_readable_target(size, "headless_render_target");
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.render_target = Some(HeadlessRenderTarget { texture, view });
         Ok(())
@@ -2394,108 +2539,10 @@ impl WgpuHeadlessRenderer {
             .render_target
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?;
-        let width = target.texture.width();
-        let height = target.texture.height();
-        let bytes_per_row = width
-            .checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("Headless render target row size overflowed"))?;
-        let padded_bytes_per_row = bytes_per_row
-            .checked_next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-            .ok_or_else(|| anyhow::anyhow!("Headless padded row size overflowed"))?;
-        let buffer_size = u64::from(padded_bytes_per_row)
-            .checked_mul(u64::from(height))
-            .ok_or_else(|| anyhow::anyhow!("Headless readback buffer size overflowed"))?;
-        anyhow::ensure!(
-            buffer_size <= self.core.resources.device.limits().max_buffer_size,
-            "Headless readback buffer size {buffer_size} exceeds maximum buffer size {}",
-            self.core.resources.device.limits().max_buffer_size
-        );
-        let readback_buffer = self
-            .core
-            .resources
-            .device
-            .create_buffer(&wgpu::BufferDescriptor {
-                label: Some("headless_readback_buffer"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-        let mut encoder =
-            self.core
-                .resources
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("headless_readback_encoder"),
-                });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback_buffer,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-            },
-            wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-        );
-        let submission = self
-            .core
-            .resources
-            .queue
-            .submit(std::iter::once(encoder.finish()));
-        let (sender, receiver) = std::sync::mpsc::channel();
-        readback_buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                if sender.send(result).is_err() {
-                    log::error!("Headless readback receiver was dropped before mapping completed");
-                }
-            });
-        self.core
-            .resources
-            .device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(std::time::Duration::from_secs(30)),
-            })
-            .map_err(|error| anyhow::anyhow!("Failed to wait for headless rendering: {error}"))?;
-        receiver
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .map_err(|error| anyhow::anyhow!("Failed to receive headless mapping result: {error}"))?
-            .map_err(|error| anyhow::anyhow!("Failed to map headless readback buffer: {error}"))?;
+        let readback = TextureReadback::start(&self.core.resources, &target.texture)?;
+        let image = readback.finish()?;
         self.check_gpu_errors()?;
-
-        let mapped_data = readback_buffer.slice(..).get_mapped_range()?;
-        let pixel_capacity = usize::try_from(u64::from(bytes_per_row) * u64::from(height))
-            .map_err(|_| anyhow::anyhow!("Headless image size exceeds addressable memory"))?;
-        let mut pixels = Vec::with_capacity(pixel_capacity);
-        for row in mapped_data
-            .chunks_exact(padded_bytes_per_row as usize)
-            .take(height as usize)
-        {
-            pixels.extend_from_slice(&row[..bytes_per_row as usize]);
-        }
-        drop(mapped_data);
-        readback_buffer.unmap();
-
-        if self.core.target_format == wgpu::TextureFormat::Bgra8Unorm {
-            for pixel in pixels.chunks_exact_mut(4) {
-                pixel.swap(0, 2);
-            }
-        }
-
-        image::RgbaImage::from_raw(width, height, pixels)
-            .ok_or_else(|| anyhow::anyhow!("Failed to create image from headless pixel data"))
+        Ok(image)
     }
 }
 

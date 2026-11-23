@@ -2047,6 +2047,14 @@ impl PlatformWindow for WaylandWindow {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    fn capture_frame(&self, scene: &Scene) -> anyhow::Result<gpui::FrameCapture> {
+        let mut state = self.borrow_mut();
+        let Some(renderer) = &mut state.renderer else {
+            anyhow::bail!("the window has no renderer to capture a frame with");
+        };
+        renderer.capture_frame(scene)
+    }
+
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
         let state = &mut *state;

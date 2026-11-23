@@ -3273,6 +3273,15 @@ impl Window {
         }
     }
 
+    /// Captures the frame the window shows, in device pixels: draws its scene once more into a
+    /// texture of its own, and returns what waits for the GPU and reads the pixels back, to be run
+    /// on a background thread. Called while the next frame is being built, it captures the frame
+    /// before that one.
+    pub fn capture_frame(&self) -> anyhow::Result<crate::FrameCapture> {
+        self.platform_window
+            .capture_frame(&self.rendered_frame.scene)
+    }
+
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
     /// This does not present the frame to screen - useful for visual testing where we want
     /// to capture what would be rendered without displaying it or requiring the window to be visible.

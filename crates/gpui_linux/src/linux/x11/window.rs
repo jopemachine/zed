@@ -1779,6 +1779,14 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
     }
 
+    fn capture_frame(&self, scene: &Scene) -> anyhow::Result<gpui::FrameCapture> {
+        let mut state = self.0.state.borrow_mut();
+        let Some(renderer) = &mut state.renderer else {
+            anyhow::bail!("the window has no renderer to capture a frame with");
+        };
+        renderer.capture_frame(scene)
+    }
+
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
         let inner = &mut *inner;

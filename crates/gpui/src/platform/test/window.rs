@@ -597,6 +597,12 @@ impl PlatformWindow for TestWindow {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    fn capture_frame(&self, scene: &Scene) -> anyhow::Result<crate::FrameCapture> {
+        let image = self.render_to_image(scene)?;
+        Ok(Box::new(move || Ok(image)))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<RgbaImage> {
         let scale_factor = self.scale_factor();
         let mut state = self.0.lock();

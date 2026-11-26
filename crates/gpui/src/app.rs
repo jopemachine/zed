@@ -987,7 +987,10 @@ pub struct App {
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
     pub(crate) layout_rounding: Rc<Cell<LayoutRounding>>,
+    pub(crate) tooltip_show_delay: Option<Duration>,
+    pub(crate) tooltip_hide_delay: Duration,
     pub(crate) tooltip_exit_duration: Duration,
+    pub(crate) tooltip_anchor_options: Option<TooltipAnchorOptions>,
 
     pub(crate) window_update_stack: Vec<WindowUpdateEntry>,
     pub(crate) mode: GpuiMode,
@@ -1049,7 +1052,10 @@ impl App {
                 text_system,
                 text_rendering_mode: Rc::new(Cell::new(TextRenderingMode::default())),
                 layout_rounding: Rc::new(Cell::new(LayoutRounding::default())),
+                tooltip_show_delay: None,
+                tooltip_hide_delay: Duration::ZERO,
                 tooltip_exit_duration: Duration::ZERO,
+                tooltip_anchor_options: None,
                 mode: GpuiMode::Production,
                 actions: Rc::new(ActionRegistry::default()),
                 pending_updates: 0,
@@ -1999,11 +2005,36 @@ impl App {
         self.layout_rounding.get()
     }
 
+    /// Sets the default delay before a hovered element's tooltip is shown.
+    ///
+    /// Individual elements can override this with
+    /// [`StatefulInteractiveElement::tooltip_show_delay`](crate::StatefulInteractiveElement::tooltip_show_delay).
+    pub fn set_tooltip_show_delay(&mut self, delay: Duration) {
+        self.tooltip_show_delay = Some(delay);
+    }
+
+    /// Sets how long a tooltip remains shown after the pointer leaves its element before hiding.
+    ///
+    /// Moving the pointer back over the element or onto the tooltip within this duration cancels
+    /// hiding. Zero, the default, hides non-hoverable tooltips immediately.
+    pub fn set_tooltip_hide_delay(&mut self, delay: Duration) {
+        self.tooltip_hide_delay = delay;
+    }
+
     /// Has every window keep drawing a tooltip for `duration` after hiding it, at the place it
     /// was drawn and without taking the mouse, so the tooltip's view can draw its exit (see
     /// [`Window::tooltip_exiting_since`]). Zero, the default, takes a hidden tooltip away at once.
     pub fn set_tooltip_exit_duration(&mut self, duration: Duration) {
         self.tooltip_exit_duration = duration;
+    }
+
+    /// Sets default element-anchored positioning for tooltips drawn by windows in this app.
+    ///
+    /// When `None` (the default), tooltips are placed beside the pointer. When `Some`, tooltips
+    /// are positioned relative to the hovered element's bounds, flipping to the opposite side when
+    /// clipped and staying inset from window edges by `viewport_margin`.
+    pub fn set_tooltip_anchor_options(&mut self, options: Option<TooltipAnchorOptions>) {
+        self.tooltip_anchor_options = options;
     }
 
     /// Writes data to the platform clipboard.
@@ -3705,6 +3736,30 @@ pub struct AnyDrag {
 pub type ExternalDragPayloadSource =
     Box<dyn FnOnce(&mut Window, &mut App) -> Option<ExternalDragPayload> + 'static>;
 
+/// Where a tooltip is placed relative to its hovered element.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TooltipPlacement {
+    /// Centered above the element, flipping below when clipped at the top edge.
+    Above,
+    /// Centered below the element, flipping above when clipped at the bottom edge.
+    Below,
+    /// Centered at the trailing (right) edge of the element, flipping to the leading edge when clipped.
+    End,
+    /// Centered at the leading (left) edge of the element, flipping to the trailing edge when clipped.
+    Start,
+}
+
+/// Default anchor-based positioning for tooltips rendered by windows in an app.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TooltipAnchorOptions {
+    /// Default side of the hovered element to place the tooltip on.
+    pub placement: TooltipPlacement,
+    /// Distance between the element edge and the tooltip edge.
+    pub gap: Pixels,
+    /// Minimum inset kept between the tooltip and each edge of the window viewport.
+    pub viewport_margin: Pixels,
+}
+
 /// Contains state associated with a tooltip. You'll only need this struct if you're implementing
 /// tooltip behavior on a custom element. Otherwise, use [Div::tooltip](crate::Interactivity::tooltip).
 #[derive(Clone)]
@@ -3714,6 +3769,12 @@ pub struct AnyTooltip {
 
     /// The absolute position of the mouse when the tooltip was deployed.
     pub mouse_position: Point<Pixels>,
+
+    /// The bounds of the hovered element that triggered the tooltip, when available.
+    pub anchor_bounds: Option<Bounds<Pixels>>,
+
+    /// Per-element placement override when anchored tooltip positioning is enabled.
+    pub placement: Option<TooltipPlacement>,
 
     /// Given the bounds of the tooltip, checks whether the tooltip should still be visible and
     /// updates its state accordingly. This is needed atop the hovered element's mouse move handler

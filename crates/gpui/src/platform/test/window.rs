@@ -639,9 +639,11 @@ impl PlatformWindow for TestWindow {
     fn start_external_drag(&self, payload: &crate::ExternalDragPayload) -> bool {
         let mut state = self.0.lock();
         match payload {
-            crate::ExternalDragPayload::Files(paths) => {
+            crate::ExternalDragPayload::Files(paths)
+            | crate::ExternalDragPayload::FilesAndInApp(paths) => {
                 state.external_drag_files.extend_from_slice(paths.entries());
             }
+            crate::ExternalDragPayload::InApp => {}
         }
         state.start_external_drag_result
     }

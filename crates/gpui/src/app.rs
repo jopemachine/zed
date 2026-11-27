@@ -868,14 +868,15 @@ impl GpuiMode {
 
 struct PlatformOwnedDrag {
     source_window: WindowId,
+    restores_in_other_windows: bool,
     state: PlatformOwnedDragState,
 }
 
 enum PlatformOwnedDragState {
     Suspended(AnyDrag),
-    // A source-window drop consumes `active_drag` before AppKit ends the dragging session, so this
+    // A window drop consumes `active_drag` before AppKit ends the dragging session, so this
     // marker can outlive the active drag and is cleaned up by `FileDropEvent::Ended`.
-    RestoredInSourceWindow,
+    RestoredInWindow(WindowId),
 }
 
 /// How layout rounds lengths to device pixels.
@@ -3188,9 +3189,9 @@ impl App {
     pub fn stop_active_drag(&mut self, window: &mut Window) -> bool {
         if self.active_drag.is_some() {
             self.active_drag = None;
+            let window_id = window.window_handle().window_id();
             if self.platform_owned_drag.as_ref().is_some_and(|drag| {
-                drag.source_window == window.window_handle().window_id()
-                    && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+                matches!(&drag.state, PlatformOwnedDragState::RestoredInWindow(id) if *id == window_id)
             }) {
                 self.platform_owned_drag = None;
             }
@@ -3201,40 +3202,45 @@ impl App {
         }
     }
 
-    pub(crate) fn hand_active_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+    pub(crate) fn hand_active_drag_to_platform(
+        &mut self,
+        source_window: WindowId,
+        restores_in_other_windows: bool,
+    ) -> bool {
         let Some(drag) = self.active_drag.take() else {
             return false;
         };
         self.platform_owned_drag = Some(PlatformOwnedDrag {
             source_window,
+            restores_in_other_windows,
             state: PlatformOwnedDragState::Suspended(drag),
         });
         true
     }
 
-    pub(crate) fn restore_platform_drag(&mut self, source_window: WindowId) -> bool {
-        let Some(platform_drag) = self
-            .platform_owned_drag
-            .as_mut()
-            .filter(|drag| drag.source_window == source_window)
-        else {
+    pub(crate) fn restore_platform_drag(&mut self, entering_window: WindowId) -> bool {
+        let Some(platform_drag) = self.platform_owned_drag.as_mut().filter(|drag| {
+            drag.restores_in_other_windows || drag.source_window == entering_window
+        }) else {
             return false;
         };
-        let state = std::mem::replace(
+        match std::mem::replace(
             &mut platform_drag.state,
-            PlatformOwnedDragState::RestoredInSourceWindow,
-        );
-        let PlatformOwnedDragState::Suspended(drag) = state else {
-            return false;
-        };
-        self.active_drag = Some(drag);
-        true
+            PlatformOwnedDragState::RestoredInWindow(entering_window),
+        ) {
+            PlatformOwnedDragState::Suspended(drag) => {
+                self.active_drag = Some(drag);
+                true
+            }
+            PlatformOwnedDragState::RestoredInWindow(previous_window) => {
+                previous_window != entering_window && self.active_drag.is_some()
+            }
+        }
     }
 
-    pub(crate) fn hand_restored_drag_to_platform(&mut self, source_window: WindowId) -> bool {
+    pub(crate) fn hand_restored_drag_to_platform(&mut self, exiting_window: WindowId) -> bool {
         let Some(platform_drag) = self.platform_owned_drag.as_mut().filter(|drag| {
-            drag.source_window == source_window
-                && matches!(&drag.state, PlatformOwnedDragState::RestoredInSourceWindow)
+            matches!(&drag.state, PlatformOwnedDragState::RestoredInWindow(id) if *id == exiting_window)
         }) else {
             return false;
         };

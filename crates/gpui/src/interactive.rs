@@ -726,7 +726,22 @@ impl ExternalPaths {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum ExternalDragPayload {
     /// Real on-disk paths, handed to the platform as an outbound file drag.
+    /// Re-entering the source window restores the original drag; other windows receive `ExternalPaths`.
     Files(FileDragPaths),
+    /// An in-process drag promoted to a native dragging session so it can cross into other
+    /// windows of the same application without exporting files to external applications.
+    InApp,
+    /// Real on-disk paths for external applications, while restoring the original typed in-process
+    /// drag whenever the session enters any window of the same application.
+    FilesAndInApp(FileDragPaths),
+}
+
+impl ExternalDragPayload {
+    /// Whether this platform drag restores the original typed in-process drag in other windows of
+    /// the same application (not only the source window).
+    pub(crate) fn restores_in_other_windows(&self) -> bool {
+        matches!(self, Self::InApp | Self::FilesAndInApp(_))
+    }
 }
 
 /// Paths handed to the platform for a native file drag. Directory metadata is

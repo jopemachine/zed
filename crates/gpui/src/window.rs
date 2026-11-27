@@ -6524,8 +6524,11 @@ impl Window {
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
                     self.mouse_position = position;
-                    let source_window = self.handle.window_id();
-                    if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
+                    let entering_window = self.handle.window_id();
+                    if !cx.restore_platform_drag(entering_window)
+                        && cx.active_drag.is_none()
+                        && !paths.paths().is_empty()
+                    {
                         cx.active_drag = Some(AnyDrag {
                             value: Arc::new(paths.clone()),
                             view: cx.new(|_| paths).into(),
@@ -6654,7 +6657,10 @@ impl Window {
             return;
         };
         if self.platform_window.start_external_drag(&payload)
-            && cx.hand_active_drag_to_platform(self.handle.window_id())
+            && cx.hand_active_drag_to_platform(
+                self.handle.window_id(),
+                payload.restores_in_other_windows(),
+            )
         {
             self.refresh();
         }
@@ -10921,6 +10927,107 @@ mod tests {
             cx.test_window(failed.window).external_drag_files(),
             [(failed_path, true)]
         );
+    }
+
+    #[crate::test]
+    fn cross_window_in_app_drag_restores_and_drops_in_target_window(cx: &mut TestAppContext) {
+        let cross_window_dropped: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+        let dropped_target = cross_window_dropped.clone();
+        struct InAppDragSource;
+        impl Render for InAppDragSource {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("in-app-drag-source")
+                    .size_full()
+                    .on_drag("cross-window-item".to_string(), |_, _, _, cx| {
+                        cx.new(|_| Empty)
+                    })
+                    .external_drag_payload::<String>(|_, _, _| Some(ExternalDragPayload::InApp))
+            }
+        }
+        struct InAppDragTarget(Rc<RefCell<Option<String>>>);
+        impl Render for InAppDragTarget {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let target = self.0.clone();
+                div()
+                    .id("in-app-drag-target")
+                    .size_full()
+                    .on_drop::<String>(move |value, _, _| {
+                        *target.borrow_mut() = Some(value.clone());
+                    })
+            }
+        }
+        let source_handle: AnyWindowHandle = cx.add_window(|_, _| InAppDragSource).into();
+        cx.test_window(source_handle)
+            .set_start_external_drag_result(true);
+        let target_handle: AnyWindowHandle =
+            cx.add_window(|_, _| InAppDragTarget(dropped_target)).into();
+        let outside_position = point(px(-1.), px(20.));
+        let _ = cx.update_window(source_handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: point(px(20.), px(20.)),
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: point(px(40.), px(20.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_some());
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: outside_position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(cx.active_drag.is_none());
+        });
+        let _ = cx.update_window(target_handle, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                FileDropEvent::Entered {
+                    position: point(px(25.), px(25.)),
+                    paths: ExternalPaths::default(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            assert!(
+                cx.active_drag
+                    .as_ref()
+                    .and_then(|drag| drag.value.downcast_ref::<String>())
+                    .is_some_and(|s| s == "cross-window-item")
+            );
+            window.dispatch_event(
+                FileDropEvent::Submit {
+                    position: point(px(25.), px(25.)),
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        assert_eq!(
+            cross_window_dropped.borrow().as_deref(),
+            Some("cross-window-item")
+        );
+        let _ = cx.update_window(source_handle, |_, window, cx| {
+            window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
+        });
     }
 
     struct FocusForwarder {
